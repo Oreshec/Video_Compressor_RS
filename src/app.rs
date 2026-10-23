@@ -727,6 +727,9 @@ impl VcApp {
     }
 
     fn draw_file_rows(&mut self, ui: &mut egui::Ui) {
+        // Удаление отложено до конца кадра: remove прямо во время цикла
+        // отрисовки Grid смещал индексы — окно падало без сообщения.
+        let mut remove_idx: Option<usize> = None;
         egui::ScrollArea::vertical()
             .max_height(220.0)
             .id_salt("files_scroll")
@@ -737,14 +740,26 @@ impl VcApp {
                     .striped(true)
                     .show(ui, |ui| {
                         for i in 0..self.files.len() {
-                            self.draw_file_row(ui, i);
+                            self.draw_file_row(ui, i, &mut remove_idx);
                             ui.end_row();
                         }
                     });
             });
+        if let Some(i) = remove_idx {
+            if i < self.files.len() {
+                self.add_log(format!("Убран: {}", self.files[i].name()));
+                self.files.remove(i);
+                self.save_settings();
+            }
+        }
     }
 
-    fn draw_file_row(&mut self, ui: &mut egui::Ui, i: usize) {
+    fn draw_file_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        i: usize,
+        remove_idx: &mut Option<usize>,
+    ) {
         let row = &self.files[i];
         let name = row.name();
         // 1: имя файла.
@@ -814,9 +829,8 @@ impl VcApp {
                 }
             }
             if ui.button("×").clicked() {
-                self.files.remove(i);
+                *remove_idx = Some(i);
                 ui.ctx().request_repaint();
-                self.save_settings();
             }
         });
     }

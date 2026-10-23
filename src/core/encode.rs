@@ -10,7 +10,7 @@ use std::thread;
 use super::bitrate::{
     build_plan, estimate_size_mb, resolve_scale, CompressionPlan, MediaInfo,
 };
-use super::ffmpeg::FfmpegPaths;
+use super::ffmpeg::{apply_no_window, FfmpegPaths};
 use super::presets::{hw_preset, MAX_ATTEMPTS, MIN_VIDEO_BITRATE_BPS, SAFETY_FACTOR};
 
 /// Общие для потоков ошибки ядра (аналоги исключений core.py).
@@ -58,16 +58,6 @@ pub struct CompressionResult {
 pub type ProgressCb = dyn Fn(f64, &str);
 
 const NULL_OUTPUT: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
-
-/// `CREATE_NO_WINDOW` — не мигать консолью на Windows.
-#[cfg(windows)]
-fn apply_no_window(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x0800_0000);
-}
-
-#[cfg(not(windows))]
-fn apply_no_window(_cmd: &mut Command) {}
 
 /// Разобрать строку `out_time=HH:MM:SS.frac` → секунды.
 pub fn parse_progress_line(line: &str) -> Option<f64> {
@@ -265,9 +255,10 @@ fn encode_once(
         let mut line = String::new();
         loop {
             if cancel.load(Ordering::Relaxed) {
-                let _ = Command::new("taskkill")
-                    .args(["/PID", &proc.id().to_string(), "/T", "/F"])
-                    .output();
+                let mut killer = Command::new("taskkill");
+                killer.args(["/PID", &proc.id().to_string(), "/T", "/F"]);
+                apply_no_window(&mut killer);
+                let _ = killer.output();
                 let _ = proc.kill();
                 return Err(CoreError::Cancelled);
             }

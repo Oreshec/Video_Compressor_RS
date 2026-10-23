@@ -23,6 +23,17 @@ fn portable_dir() -> PathBuf {
     program_dir().join("ffmpeg")
 }
 
+/// `CREATE_NO_WINDOW` — дочерние процессы не должны мигать консолями
+/// (пользователь видел CMD-окна при каждом анализе файла).
+#[cfg(windows)]
+pub fn apply_no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000);
+}
+
+#[cfg(not(windows))]
+pub fn apply_no_window(_cmd: &mut Command) {}
+
 /// Поиск по PATH вручную (без внешних крейтов).
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -80,8 +91,10 @@ pub fn find_ffmpeg() -> Option<FfmpegPaths> {
 /// Парсит вывод `ffmpeg -encoders`.
 pub fn usable_encoders(paths: &FfmpegPaths) -> Vec<String> {
     let supported = ["h264_nvenc", "h264_qsv", "h264_amf"];
-    let Ok(out) = Command::new(&paths.ffmpeg).args(["-hide_banner", "-encoders"]).output()
-    else {
+    let mut command = Command::new(&paths.ffmpeg);
+    command.args(["-hide_banner", "-encoders"]);
+    apply_no_window(&mut command);
+    let Ok(out) = command.output() else {
         return vec!["libx264".into()];
     };
     let text = String::from_utf8_lossy(&out.stdout);

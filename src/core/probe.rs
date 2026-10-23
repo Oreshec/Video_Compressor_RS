@@ -80,11 +80,13 @@ pub fn probe(paths: &FfmpegPaths, path: &Path) -> Result<MediaInfo, ProbeError> 
     if !path.is_file() {
         return Err(ProbeError(format!("Файл не найден: {}", path.display())));
     }
-    let out = Command::new(&paths.ffprobe)
-        .args([
-            "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
-        ])
-        .arg(path)
+    let mut command = Command::new(&paths.ffprobe);
+    command.args([
+        "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
+    ]);
+    command.arg(path);
+    super::ffmpeg::apply_no_window(&mut command);
+    let out = command
         .output()
         .map_err(|e| ProbeError(format!("Не удалось запустить ffprobe: {e}")))?;
 
