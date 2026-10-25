@@ -553,7 +553,11 @@ mod tests {
 
     #[test]
     fn output_path_with_dir() {
-        let input = Path::new("C:\\vid\\clip.mp4");
+        let (input, out_dir, prefix) = if cfg!(windows) {
+            (Path::new(r"C:\vid\clip.mp4"), r"D:\small", "D:\\")
+        } else {
+            (Path::new("/tmp/vid/clip.mp4"), "/tmp/small", "/tmp/")
+        };
         assert_eq!(
             default_output_path(input, None)
                 .file_name()
@@ -561,8 +565,12 @@ mod tests {
                 .to_string_lossy(),
             "clip_compressed.mp4"
         );
-        let out = default_output_path(input, Some("D:\\small"));
-        assert!(out.to_string_lossy().starts_with("D:\\small"));
+        let out = default_output_path(input, Some(out_dir));
+        assert!(
+            out.to_string_lossy().starts_with(prefix),
+            "неожиданный путь: {}",
+            out.display()
+        );
         assert_eq!(out.file_name().unwrap().to_string_lossy(), "clip_compressed.mp4");
     }
 
