@@ -46,7 +46,8 @@ fn parse_fps(raw: Option<&Value>) -> Option<f64> {
         if n != 0.0 && d != 0.0 {
             return Some((n / d * 1000.0).round() / 1000.0);
         }
-        return Some(f64::NAN).filter(|v| !v.is_nan());
+        // Битая дробь (нулевой числитель или знаменатель) — данных нет.
+        return None;
     }
     raw.trim().parse().ok()
 }
@@ -159,7 +160,7 @@ mod tests {
 
     #[test]
     fn fps_fraction() {
-        assert_eq!(parse_fps(Some(&json!("30000/1001"))).map(|v| v), Some(29.97));
+        assert_eq!(parse_fps(Some(&json!("30000/1001"))), Some(29.97));
         assert_eq!(parse_fps(Some(&json!("29.97"))), Some(29.97));
         assert_eq!(parse_fps(Some(&json!(""))), None);
     }

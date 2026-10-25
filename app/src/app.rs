@@ -12,7 +12,7 @@ use std::thread;
 
 use eframe::egui;
 
-use crate::core::{
+use vc_core::{
     bitrate::build_plan,
     compress, default_output_path,
     encode::ProgressCb,
@@ -287,7 +287,7 @@ impl VcApp {
 
                     let output =
                         default_output_path(&path, output_dir_or_none(&settings.output_dir));
-                    let target = settings.target_size();
+                    let target = settings.target_size_bytes();
                     let preset = settings.speed_preset();
                     let max_height = settings.max_height();
                     let two_pass = settings.two_pass;
@@ -355,12 +355,9 @@ impl VcApp {
         // Приём лога.
         let mut new_lines = Vec::new();
         if let Some(rx) = self.log_rx.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(line) => new_lines.push(line),
-                    Err(_) => break,
-                }
-            }
+        while let Ok(line) = rx.try_recv() {
+            new_lines.push(line);
+        }
         }
         for line in new_lines {
             self.add_log(line);
@@ -437,6 +434,7 @@ fn output_dir_or_none(s: &str) -> Option<&str> {
 
 fn load_fonts(ctx: &egui::Context) {
     // Windows: системный Segoe UI (кириллица есть) и Consolas для лога.
+    // На Linux/macOS egui использует встроенные Noto Sans / Noto Sans Mono.
     let mut fonts = egui::FontDefinitions::default();
     let regular = "C:\\Windows\\Fonts\\segoeui.ttf";
     let mono = "C:\\Windows\\Fonts\\consola.ttf";
@@ -456,6 +454,7 @@ fn load_fonts(ctx: &egui::Context) {
             list.insert(0, "consolas".into());
         }
     }
+    // На не-Windows egui сам подхватит системные шрифты через fontconfig / Core Text.
     ctx.set_fonts(fonts);
 }
 
@@ -792,7 +791,7 @@ impl VcApp {
                     info.size_mb()
                 ));
                 // 3: план под текущие настройки.
-                let plan = build_plan(&info, self.settings.target_size());
+                let plan = build_plan(&info, self.settings.target_size_bytes());
                 ui.label(
                     egui::RichText::new(plan_note(&plan))
                         .small()
@@ -800,9 +799,12 @@ impl VcApp {
                 );
                 // 4: оценка.
                 ui.label(
-                    egui::RichText::new(format!("≈ {:.1} МБ", plan.estimated_size_mb))
-                        .small()
-                        .color(if plan.low_bitrate() { WARN } else { OK }),
+                    egui::RichText::new(format!(
+                        "≈ {:.1} МБ",
+                        plan.estimated_size_bytes as f64 / (1024.0 * 1024.0)
+                    ))
+                    .small()
+                    .color(if plan.low_bitrate() { WARN } else { OK }),
                 );
             }
         }

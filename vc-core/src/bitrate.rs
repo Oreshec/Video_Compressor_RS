@@ -1,11 +1,15 @@
 //! Расчёты битрейта и разрешения — порт `core.py` (расчёты + разрешение).
+//!
+//! Соглашение SPEC v0.2 (§7.3): внутренняя арифметика — в байтах.
+//! Целевой размер и оценка результата хранятся как `u64` байтов;
+//! перевод МБ ↔ байты делается на границе UI, внутри ядра байты и биты.
 
 use super::presets::{
     LOW_BITRATE_WARN_BPS, MIN_VIDEO_BITRATE_BPS, MP4_AUDIO_COPY_CODECS, SAFETY_FACTOR,
     SCALE_LADDER, TARGET_BITS_PER_PIXEL,
 };
 
-#[allow(dead_code)] // поля портированы 1:1 из core.py, часть читается дальше
+/// Информация об исходном файле из probe.
 #[derive(Debug, Clone)]
 pub struct MediaInfo {
     pub path: std::path::PathBuf,
@@ -25,7 +29,6 @@ impl MediaInfo {
         self.size_bytes as f64 / (1024.0 * 1024.0)
     }
 
-    #[allow(dead_code)]
     pub fn resolution(&self) -> String {
         match (self.width, self.height) {
             (Some(w), Some(h)) => format!("{w}×{h}"),
@@ -38,14 +41,15 @@ impl MediaInfo {
     }
 }
 
-/// План сжатия (аналог `CompressionPlan`).
-#[allow(dead_code)]
+/// План сжатия.
 #[derive(Debug, Clone)]
 pub struct CompressionPlan {
-    pub target_size_mb: f64,
+    /// Целевой максимальный размер, байты.
+    pub target_size_bytes: u64,
     pub video_bitrate_bps: i64,
     pub audio_bitrate_bps: i64,
-    pub estimated_size_mb: f64,
+    /// Оценка размера результата, байты.
+    pub estimated_size_bytes: u64,
     pub audio_copy: bool,
 }
 
@@ -60,17 +64,17 @@ impl CompressionPlan {
     }
 }
 
-/// Оценка размера результата в МБ.
-pub fn estimate_size_mb(duration_sec: f64, video_bps: i64, audio_bps: i64) -> f64 {
+/// Оценка размера результата в байтах: биты/с × секунды → биты → /8.
+pub fn estimate_size_bytes(duration_sec: f64, video_bps: i64, audio_bps: i64) -> u64 {
     if duration_sec <= 0.0 {
-        return 0.0;
+        return 0;
     }
-    (video_bps + audio_bps) as f64 * duration_sec / (8.0 * 1024.0 * 1024.0)
+    ((video_bps + audio_bps) as f64 * duration_sec / 8.0) as u64
 }
 
-/// Видеобитрейт (бит/с), чтобы уложиться в `target_size_mb`.
+/// Видеобитрейт (бит/с), чтобы уложиться в `target_size_bytes`.
 pub fn compute_video_bitrate(
-    target_size_mb: f64,
+    target_size_bytes: u64,
     duration_sec: f64,
     audio_bps: i64,
     safety_factor: f64,
@@ -78,7 +82,7 @@ pub fn compute_video_bitrate(
     if duration_sec <= 0.0 {
         return 1_000_000;
     }
-    let target_bits = target_size_mb * 8.0 * 1024.0 * 1024.0;
+    let target_bits = target_size_bytes as f64 * 8.0;
     let mut video_bits = target_bits * safety_factor - audio_bps as f64 * duration_sec;
     if video_bits <= 0.0 {
         video_bits = (target_bits / 2.0).floor();
@@ -88,19 +92,19 @@ pub fn compute_video_bitrate(
 
 /// План сжатия: аудио не съедает более 40% бюджета; совместимое аудио
 /// в бюджете копируется без перекодирования.
-pub fn build_plan(info: &MediaInfo, target_size_mb: f64) -> CompressionPlan {
-    build_plan_with_safety(info, target_size_mb, SAFETY_FACTOR)
+pub fn build_plan(info: &MediaInfo, target_size_bytes: u64) -> CompressionPlan {
+    build_plan_with_safety(info, target_size_bytes, SAFETY_FACTOR)
 }
 
 pub fn build_plan_with_safety(
     info: &MediaInfo,
-    target_size_mb: f64,
+    target_size_bytes: u64,
     safety_factor: f64,
 ) -> CompressionPlan {
-    assert!(target_size_mb > 0.0, "Целевой размер должен быть положительным");
+    assert!(target_size_bytes > 0, "Целевой размер должен быть положительным");
     assert!(info.duration_sec > 0.0, "Длительность должна быть положительной");
-    let audio_budget_bps =
-        (target_size_mb * 8.0 * 1024.0 * 1024.0 * 0.4 / info.duration_sec) as i64;
+    let target_bits = target_size_bytes as f64 * 8.0;
+    let audio_budget_bps = (target_bits * 0.4 / info.duration_sec) as i64;
     let audio_orig = info.audio_bitrate_bps.max(0);
     let codec = info.audio_codec.clone().unwrap_or_default();
     let audio_copy = info.has_audio()
@@ -115,12 +119,12 @@ pub fn build_plan_with_safety(
         audio_orig.min(audio_budget_bps)
     };
     let video_bps =
-        compute_video_bitrate(target_size_mb, info.duration_sec, audio_bps, safety_factor);
+        compute_video_bitrate(target_size_bytes, info.duration_sec, audio_bps, safety_factor);
     CompressionPlan {
-        target_size_mb,
+        target_size_bytes,
         video_bitrate_bps: video_bps,
         audio_bitrate_bps: audio_bps,
-        estimated_size_mb: estimate_size_mb(info.duration_sec, video_bps, audio_bps),
+        estimated_size_bytes: estimate_size_bytes(info.duration_sec, video_bps, audio_bps),
         audio_copy,
     }
 }
@@ -184,6 +188,9 @@ pub fn resolve_scale(
 mod tests {
     use super::*;
 
+    const TEN_MIB: u64 = 10 * 1024 * 1024;
+    const ONE_MIB: u64 = 1024 * 1024;
+
     fn info(duration: f64, audio: i64) -> MediaInfo {
         MediaInfo {
             path: std::path::PathBuf::from("a.mp4"),
@@ -200,37 +207,42 @@ mod tests {
     }
 
     #[test]
-    fn estimate_matches_python() {
-        // 1 Мбит/с на 60 сек = 7.5 МБ… формула: (bps)*sec/8MiB
-        let mb = estimate_size_mb(60.0, 1_000_000, 0);
-        assert!((mb - 1_000_000.0 * 60.0 / 8_388_608.0).abs() < 1e-9);
+    fn estimate_bytes() {
+        // 1 Мбит/с на 60 с = 1_000_000 × 60 / 8 байт.
+        assert_eq!(estimate_size_bytes(60.0, 1_000_000, 0), 7_500_000);
+        assert_eq!(estimate_size_bytes(0.0, 1_000_000, 0), 0);
     }
 
     #[test]
     fn bitrate_zero_duration_fallback() {
-        assert_eq!(compute_video_bitrate(10.0, 0.0, 0, SAFETY_FACTOR), 1_000_000);
+        assert_eq!(compute_video_bitrate(TEN_MIB, 0.0, 0, SAFETY_FACTOR), 1_000_000);
     }
 
     #[test]
     fn bitrate_negative_budget_falls_back_to_half() {
         // Аудио съедает весь бюджет → видео получает половину целевых битов.
-        let br = compute_video_bitrate(10.0, 60.0, i64::MAX / 1000, SAFETY_FACTOR);
-        assert_eq!(br, MIN_VIDEO_BITRATE_BPS.max((10.0 * 8.0 * 1024.0 * 1024.0 / 2.0 / 60.0) as i64));
+        let br = compute_video_bitrate(TEN_MIB, 60.0, i64::MAX / 1000, SAFETY_FACTOR);
+        assert_eq!(
+            br,
+            MIN_VIDEO_BITRATE_BPS.max((TEN_MIB as f64 * 8.0 / 2.0 / 60.0) as i64)
+        );
     }
 
     #[test]
     fn plan_audio_copy_in_budget() {
-        let p = build_plan(&info(60.0, 96_000), 10.0);
-        // 96 kbps аудио умещается в 40% бюджета 10 МБ на 60 с (~559 кбит/с, потолок ~223)
-        assert!(p.audio_copy, "96k should be copyable: budget {}", 10.0 * 8.0 * 1024.0 * 1024.0 * 0.4 / 60.0);
+        let p = build_plan(&info(60.0, 96_000), TEN_MIB);
+        // 96 kbps аудио умещается в 40% бюджета 10 МБ на 60 с (~559 кбит/с).
+        let budget = (TEN_MIB as f64 * 8.0 * 0.4 / 60.0) as i64;
+        assert!(p.audio_copy, "96k должно копироваться: бюджет {budget}");
         assert_eq!(p.audio_bitrate_bps, 96_000);
+        assert_eq!(p.target_size_bytes, TEN_MIB);
     }
 
     #[test]
     fn plan_audio_too_fat_gets_reencoded() {
-        let p = build_plan(&info(60.0, 600_000), 10.0);
+        let p = build_plan(&info(60.0, 600_000), TEN_MIB);
         assert!(!p.audio_copy);
-        let budget = (10.0 * 8.0 * 1024.0 * 1024.0 * 0.4 / 60.0) as i64;
+        let budget = (TEN_MIB as f64 * 8.0 * 0.4 / 60.0) as i64;
         assert_eq!(p.audio_bitrate_bps, budget.min(600_000));
     }
 
@@ -238,7 +250,7 @@ mod tests {
     fn auto_scale_picks_lower_ladder_step() {
         let mut me = info(120.0, 64_000);
         // Жёсткий лимит 1 МБ: полный 1080p даст слишком мало битов/пиксель.
-        let plan = build_plan(&me, 1.0);
+        let plan = build_plan(&me, ONE_MIB);
         let target = pick_target_height(&me, plan.video_bitrate_bps);
         assert!(target.is_some_and(|h| h < 1080));
         me.height = Some(480);

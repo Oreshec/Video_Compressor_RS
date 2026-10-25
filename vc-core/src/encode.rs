@@ -8,29 +8,65 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::bitrate::{
-    build_plan, estimate_size_mb, resolve_scale, CompressionPlan, MediaInfo,
+    build_plan, estimate_size_bytes, resolve_scale, CompressionPlan, MediaInfo,
 };
 use super::ffmpeg::{apply_no_window, FfmpegPaths};
 use super::presets::{hw_preset, MAX_ATTEMPTS, MIN_VIDEO_BITRATE_BPS, SAFETY_FACTOR};
 
 /// Общие для потоков ошибки ядра (аналоги исключений core.py).
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum CoreError {
-    FfmpegNotFound,
+    #[error("FFmpeg/ffprobe не найден в системе: {0}")]
+    FfmpegNotFound(String),
+
+    #[error("Ошибка анализа файла: {0}")]
     MediaInfo(String),
-    Encode(String),
+
+    #[error("Ошибка кодирования (кодек: {codec}): {stderr}")]
+    Encode { codec: String, stderr: String },
+
+    #[error("Сжатие отменено пользователем")]
     Cancelled,
+
+    #[error("Выходной файл совпадает с входным: {0}")]
+    PathConflict(PathBuf),
+
+    #[error("Недостаточно места на диске: нужно {needed_mb:.1} МБ, доступно {available_mb:.1} МБ")]
+    DiskFull { needed_mb: f64, available_mb: f64 },
+
+    #[error("Целевой размер должен быть положительным")]
+    InvalidTargetSize,
+
+    #[error("Входной файл не найден: {0}")]
+    InputNotFound(PathBuf),
 }
 
 impl CoreError {
-    pub fn message(&self) -> String {
+    /// Можно ли повторить попытку (например, с другим кодеком).
+    pub fn is_recoverable(&self) -> bool {
+        matches!(
+            self,
+            CoreError::Encode { .. } | CoreError::DiskFull { .. }
+        )
+    }
+
+    /// Короткое сообщение для UI (баннер).
+    pub fn short_message(&self) -> String {
         match self {
-            CoreError::FfmpegNotFound => "FFmpeg/ffprobe не найден в системе.".into(),
-            CoreError::MediaInfo(s) => s.clone(),
-            CoreError::Encode(s) => s.clone(),
-            CoreError::Cancelled => "Сжатие отменено.".into(),
+            CoreError::FfmpegNotFound(_) => "FFmpeg не найден".into(),
+            CoreError::MediaInfo(s) => format!("Ошибка анализа: {s}"),
+            CoreError::Encode { codec, .. } => format!("Ошибка {codec}"),
+            CoreError::Cancelled => "Отменено".into(),
+            CoreError::PathConflict(_) => "Конфликт путей".into(),
+            CoreError::DiskFull { .. } => "Нет места на диске".into(),
+            CoreError::InvalidTargetSize => "Неверный размер".into(),
+            CoreError::InputNotFound(_) => "Файл не найден".into(),
         }
+    }
+
+    /// Полное сообщение об ошибке (для строк лога и баннера).
+    pub fn message(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -46,7 +82,7 @@ impl From<super::probe::ProbeError> for CoreError {
 pub struct CompressionResult {
     pub input_path: PathBuf,
     pub output_path: PathBuf,
-    pub target_size_mb: f64,
+    pub target_size_bytes: u64,
     pub actual_size_mb: f64,
     pub video_bitrate_bps: i64,
     pub attempts: usize,
@@ -84,14 +120,14 @@ fn video_args(encoder: &str, preset: &str) -> Vec<String> {
             "-c:v".into(),
             "h264_nvenc".into(),
             "-preset".into(),
-            hw_preset(encoder, preset).into(),
+            hw_preset(encoder, preset),
         ],
         "h264_qsv" => vec!["-c:v".into(), "h264_qsv".into(), "-preset".into(), preset.into()],
         "h264_amf" => vec![
             "-c:v".into(),
             "h264_amf".into(),
             "-quality".into(),
-            hw_preset(encoder, preset).into(),
+            hw_preset(encoder, preset),
         ],
         _ => panic!("Неизвестный кодировщик: {encoder}"),
     }
@@ -241,7 +277,10 @@ fn encode_once(
     apply_no_window(&mut command);
     let mut proc = command
         .spawn()
-        .map_err(|e| CoreError::Encode(format!("Не удалось запустить ffmpeg: {e}")))?;
+        .map_err(|e| CoreError::Encode {
+            codec: "ffmpeg".into(),
+            stderr: format!("Не удалось запустить ffmpeg: {e}"),
+        })?;
 
     let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(stderr) = proc.stderr.take() {
@@ -297,7 +336,10 @@ fn encode_once(
     }
     let status = proc
         .wait()
-        .map_err(|_| CoreError::Encode("Процесс ffmpeg недоступен.".into()))?;
+        .map_err(|_| CoreError::Encode {
+            codec: "ffmpeg".into(),
+            stderr: "Процесс ffmpeg недоступен.".into(),
+        })?;
 
     if cancel.load(Ordering::Relaxed) {
         return Err(CoreError::Cancelled);
@@ -308,9 +350,10 @@ fn encode_once(
             .ok()
             .and_then(|list| list.iter().rev().find(|l| !l.trim().is_empty()).cloned())
             .unwrap_or_else(|| "неизвестная ошибка".into());
-        return Err(CoreError::Encode(format!(
-            "FFmpeg завершился с ошибкой: {detail}"
-        )));
+        return Err(CoreError::Encode {
+            codec: encoder.into(),
+            stderr: format!("FFmpeg завершился с ошибкой: {detail}"),
+        });
     }
     Ok(())
 }
@@ -336,7 +379,7 @@ fn run_attempts(
     paths: &FfmpegPaths,
     info: &MediaInfo,
     output: &Path,
-    target_size_mb: f64,
+    target_size_bytes: u64,
     preset: &str,
     encoder: &str,
     max_height: Option<i64>,
@@ -348,7 +391,7 @@ fn run_attempts(
     if two_pass && encoder != "libx264" {
         two_pass = false; // статистику x264 аппаратные кодеры не понимают
     }
-    let mut current = build_plan(info, target_size_mb);
+    let mut current = build_plan(info, target_size_bytes);
     let pass_logfile: Option<PathBuf> = if two_pass {
         Some(std::env::temp_dir().join(format!("vc_pass_{}", std::process::id())))
     } else {
@@ -388,15 +431,13 @@ fn run_attempts(
                 scale, &stage, false, 2, None,
             )?;
         }
-        let actual_mb = std::fs::metadata(output)
-            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
-            .unwrap_or(0.0);
-        if actual_mb <= target_size_mb || attempts >= max_attempts {
+        let actual_bytes = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+        if actual_bytes <= target_size_bytes || attempts >= max_attempts {
             return Ok(CompressionResult {
                 input_path: info.path.clone(),
                 output_path: output.to_path_buf(),
-                target_size_mb,
-                actual_size_mb: actual_mb,
+                target_size_bytes,
+                actual_size_mb: actual_bytes as f64 / (1024.0 * 1024.0),
                 video_bitrate_bps: current.video_bitrate_bps,
                 attempts,
                 encoder: encoder.into(),
@@ -404,15 +445,15 @@ fn run_attempts(
             });
         }
         // Пересчёт битрейта по реальному превышению.
-        let shrink = (target_size_mb / actual_mb) * SAFETY_FACTOR;
+        let shrink = (target_size_bytes as f64 / actual_bytes.max(1) as f64) * SAFETY_FACTOR;
         let audio_bps = ((current.audio_bitrate_bps as f64) * shrink.max(0.5)) as i64;
         let video_bps =
             MIN_VIDEO_BITRATE_BPS.max((current.video_bitrate_bps as f64 * shrink) as i64);
         current = CompressionPlan {
-            target_size_mb,
+            target_size_bytes,
             video_bitrate_bps: video_bps,
             audio_bitrate_bps: audio_bps,
-            estimated_size_mb: estimate_size_mb(info.duration_sec, video_bps, audio_bps),
+            estimated_size_bytes: estimate_size_bytes(info.duration_sec, video_bps, audio_bps),
             audio_copy: current.audio_copy,
         };
         if let Some(cb) = progress {
@@ -430,7 +471,7 @@ pub fn compress(
     paths: &FfmpegPaths,
     info: MediaInfo,
     output: PathBuf,
-    target_size_mb: f64,
+    target_size_bytes: u64,
     preset: &str,
     encoder: &str,
     max_height: Option<i64>,
@@ -438,16 +479,14 @@ pub fn compress(
     cancel: &AtomicBool,
     progress: Option<&ProgressCb>,
 ) -> Result<CompressionResult, CoreError> {
-    if target_size_mb <= 0.0 {
-        return Err(CoreError::Encode(
-            "Целевой размер должен быть положительным.".into(),
-        ));
+    if target_size_bytes == 0 {
+        return Err(CoreError::InvalidTargetSize);
     }
     if output.canonicalize().ok() == info.path.canonicalize().ok() {
-        return Err(CoreError::Encode("Выходной файл совпадает с входным.".into()));
+        return Err(CoreError::PathConflict(output.clone()));
     }
     let result = run_attempts(
-        paths, &info, &output, target_size_mb, preset, encoder, max_height,
+        paths, &info, &output, target_size_bytes, preset, encoder, max_height,
         two_pass, MAX_ATTEMPTS, progress, cancel,
     );
     match result {
@@ -460,7 +499,7 @@ pub fn compress(
             if !cancel.load(Ordering::Relaxed) && encoder != "libx264" {
                 // Аппаратный кодер не сработал — повтор через libx264.
                 return run_attempts(
-                    paths, &info, &output, target_size_mb, preset, "libx264",
+                    paths, &info, &output, target_size_bytes, preset, "libx264",
                     max_height, two_pass, MAX_ATTEMPTS, progress, cancel,
                 );
             }
@@ -501,7 +540,7 @@ pub fn format_duration(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::probe::probe;
+    use crate::probe;
 
     #[test]
     fn progress_lines() {
@@ -531,7 +570,7 @@ mod tests {
     /// если в системе есть ffprobe; иначе пропускается.
     #[test]
     fn probe_smoke_if_ffmpeg_available() {
-        let Some(paths) = crate::core::ffmpeg::find_ffmpeg() else {
+        let Some(paths) = crate::ffmpeg::find_ffmpeg() else {
             return;
         };
         let path = std::env::temp_dir().join("vc_probe_test.mp4");
@@ -555,7 +594,7 @@ mod tests {
             info.width.is_some_and(|w| w > 0),
             "width отсутствует: {info:?}"
         );
-        let plan = build_plan(&info, 1.0);
+        let plan = build_plan(&info, 1024 * 1024);
         assert!(plan.video_bitrate_bps > 0);
         let _ = std::fs::remove_file(path);
     }
@@ -563,7 +602,7 @@ mod tests {
     /// Полный прогона сжатия тестового клипа: 1 МБ цель libx264, один проход.
     #[test]
     fn compress_smoke_if_ffmpeg_available() {
-        let Some(paths) = crate::core::ffmpeg::find_ffmpeg() else {
+        let Some(paths) = crate::ffmpeg::find_ffmpeg() else {
             return;
         };
         let src = std::env::temp_dir().join("vc_comp_test_src.mp4");
@@ -586,7 +625,7 @@ mod tests {
             &paths,
             info,
             out.clone(),
-            0.5,
+            512 * 1024,
             "veryfast",
             "libx264",
             None,

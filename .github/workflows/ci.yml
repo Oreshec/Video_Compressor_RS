@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+    branches: [main, beta]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Линтер
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Тесты
+        run: cargo test --workspace
+      - name: Сборка релиза
+        run: cargo build --release
+      - name: Артефакт (прототип Slint)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: target/release/vc-ui.exe
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Системные зависимости (eframe/winit)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Линтер
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Тесты
+        run: cargo test --workspace

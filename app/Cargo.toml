@@ -1,0 +1,18 @@
+[package]
+name = "video_compressor"
+version = "2.4.0"
+edition = "2021"
+description = "Сжатие видео до заданного размера (GUI на egui)"
+publish = false
+
+# Окно не мигает консолью в Windows.
+[[bin]]
+name = "VideoCompressor"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.37"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+vc-core = { path = "../vc-core" }

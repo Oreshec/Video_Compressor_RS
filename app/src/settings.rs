@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::presets::DEFAULT_TARGET_SIZE_MB;
+use vc_core::presets::DEFAULT_TARGET_SIZE_MB;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -85,6 +85,11 @@ impl Settings {
         } else {
             DEFAULT_TARGET_SIZE_MB
         }
+    }
+
+    /// Целевой размер в байтах (внутренняя арифметика ядра — байтовая).
+    pub fn target_size_bytes(&self) -> u64 {
+        (self.target_size() * 1024.0 * 1024.0).round() as u64
     }
 
     /// Имя пресета скорости.

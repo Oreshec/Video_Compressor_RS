@@ -1,0 +1,650 @@
+import {
+    CheckBox, ComboBox, LineEdit, ListView, SpinBox,
+    HorizontalBox, VerticalBox,
+} from "std-widgets.slint";
+
+// ------------------------------------------------------------------ //
+//  Дизайн-система «Professional Studio / Graphite + Violet»           //
+//  Цвета — SPEC v0.2 §3.2. Единственный источник цветов.              //
+// ------------------------------------------------------------------ //
+
+export global Palette {
+    out property <color> bg: #151419;
+    out property <color> panel: #1D1B22;
+    out property <color> surface2: #25222C;
+    out property <color> border: #393540;
+    out property <color> accent: #A78BFA;
+    out property <color> accent-active: #8B5CF6;
+    out property <color> text: #F3F0F7;
+    out property <color> text-muted: #A6A0B1;
+    out property <color> ok: #4CCB91;
+    out property <color> warn: #E9B65C;
+    out property <color> err: #F07178;
+}
+
+// Строка списка файлов (заполняется из Rust / vc-core).
+// Поля данных — с «_», чтобы шаблонные строки "{src_size}" не парсились
+// как вычитание имён с дефисом.
+export struct FileInfo {
+    name: string,
+    meta: string,        // «1:02 · 12.3 МБ · 1920×1080 · 30 fps» — собирается в Rust
+    state: int,          // 0 в очереди · 2 кодирование · 3 готово · 4 ошибка · 5 отменено
+    status: string,
+    frac: float,
+}
+
+// ------------------------------------------------------------------ //
+//  Базовые компоненты. Корень — layout, поэтому preferred-размер      //
+//  компонентов выводится из контента: кнопки не растягиваются.        //
+// ------------------------------------------------------------------ //
+
+// Строка файла: имя + мета / статус + мини-прогресс.
+component FileRowItem inherits Rectangle {
+    in property <string> name: "";
+    in property <string> meta: "";
+    in property <int> state: 0;
+    in property <string> status: "";
+    in property <float> frac: 0.0;
+
+    height: 72px;
+    background: Palette.surface2;
+    border-width: 1px;
+    border-color: Palette.border;
+    border-radius: 8px;
+
+    // цвет статуса (дублируется текстом — SPEC §3.2)
+    property <color> status-color: state == 3 ? Palette.ok
+        : state == 4 ? Palette.err
+        : state == 5 ? Palette.warn
+        : state == 2 ? Palette.accent
+        : Palette.text-muted;
+
+    VerticalBox {
+        padding: 10px;
+        spacing: 6px;
+        HorizontalBox {
+            padding: 0;
+            spacing: 12px;
+            Text {
+                text: name;
+                color: Palette.text;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-stretch: 3;
+                overflow: elide;
+            }
+            Text {
+                text: meta;
+                color: Palette.text-muted;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 2;
+            }
+        }
+        if state == 2: Rectangle {  // мини-полоса прогресса
+            height: 4px;
+            border-radius: 2px;
+            background: Palette.panel;
+            Rectangle {
+                x: 0;
+                width: parent.width * frac;
+                border-radius: 2px;
+                background: Palette.accent;
+            }
+        }
+        Text {
+            text: status;
+            color: status-color;
+            font-size: 12px;
+            overflow: elide;
+        }
+    }
+}
+
+// Вторичная кнопка (добавить файлы, папка, отмена, обновления).
+component VcToolButton inherits Rectangle {
+    in property <string> caption;
+    in property <bool> enabled: true;
+    callback clicked <=> ta.clicked;
+    height: 32px;
+    border-radius: 6px;
+    background: ta.has-hover ? Palette.surface2 : Palette.panel;
+    border-width: 1px;
+    border-color: ta.pressed ? Palette.accent : Palette.border;
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+    }
+    HorizontalBox {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 0;
+        Text {
+            text: root.caption;
+            color: root.enabled ? Palette.text : Palette.text-muted;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+// Акцентная кнопка — основное действие (Сжать) / вторичное (Установить).
+component VcPrimaryButton inherits Rectangle {
+    in property <string> caption;
+    in property <bool> enabled: true;
+    in property <bool> secondary: false;
+    callback clicked <=> ta.clicked;
+    height: 42px;
+    border-radius: 8px;
+    background
+        : !enabled ? Palette.surface2
+        : secondary ? Palette.accent
+        : Palette.accent-active;
+    border-width: 1px;
+    border-color: enabled ? Palette.accent : Palette.border;
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+    }
+    HorizontalBox {
+        padding-left: 28px;
+        padding-right: 28px;
+        spacing: 0;
+        Text {
+            text: root.caption;
+            color: enabled ? Palette.text : Palette.text-muted;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+// Зона добавления файлов. Клик = диалог; приём из ОС — задел под API Slint.
+component DropZone inherits Rectangle {
+    in property <bool> compact: false;
+    callback open-files();
+
+    height: compact ? 64px : 180px;
+    property <bool> hover: ta.has-hover;
+    background: hover ? Palette.surface2 : Palette.bg;
+    border-width: 2px;
+    border-color: hover ? Palette.accent : Palette.border;
+    border-radius: 10px;
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.open-files(); }
+    }
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 8px;
+        alignment: center;
+        Text {
+            text: root.compact ? "Добавить ещё файлы" : "Перетащите видеофайлы сюда";
+            color: Palette.text;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "или нажмите, чтобы выбрать";
+            color: Palette.text-muted;
+            horizontal-alignment: center;
+        }
+        if !root.compact: Text {
+            text: "Поддерживаются mp4 · mkv · avi · mov · webm и другие видеофайлы";
+            color: Palette.text-muted;
+            font-size: 12px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// Переключатель «Простой / Расширенный» (SPEC §4.2, п. 2).
+component ModeSwitch inherits Rectangle {
+    in property <bool> advanced: false;
+    callback changed(bool);
+    width: 264px;
+    height: 34px;
+    border-radius: 8px;
+    background: Palette.surface2;
+    border-width: 1px;
+    border-color: Palette.border;
+
+    Rectangle {  // подсветка активной половины
+        x: root.advanced ? parent.width / 2 : 0;
+        width: parent.width / 2;
+        border-radius: 7px;
+        background: Palette.accent-active;
+    }
+    HorizontalBox {
+        padding: 0;
+        spacing: 0;
+        Rectangle {
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.changed(false); }
+            }
+            Text {
+                text: "Простой";
+                color: root.advanced ? Palette.text-muted : Palette.text;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                width: parent.width;
+            }
+        }
+        Rectangle {
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.changed(true); }
+            }
+            Text {
+                text: "Расширенный";
+                color: root.advanced ? Palette.text : Palette.text-muted;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                width: parent.width;
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ //
+//  Главное окно (SPEC §4)                                             //
+// ------------------------------------------------------------------ //
+
+export component MainWindow inherits Window {
+    title: "Video Compressor";
+    background: Palette.bg;
+    preferred-width: 1200px;
+    preferred-height: 800px;
+    min-width: 720px;
+    min-height: 560px;
+
+    // Состояние, управляемое Rust.
+    in property <[FileInfo]> files;
+    in property <int> file-count: 0;
+    in property <string> files-label: "Файлы";
+    in-out property <bool> busy: false;
+    in-out property <string> status-text: "Готов к работе";
+    in-out property <float> dock-frac: 0.0;
+    in-out property <bool> has-ffmpeg: false;
+    in-out property <string> encoder-note: "";
+
+    // Настройки.
+    in-out property <int> size-mb: 10;
+    in-out property <bool> advanced: false;
+    in-out property <bool> basic-open: true;
+    in-out property <int> profile-index: 0;
+    in-out property <int> preset-index: 1;
+    in-out property <int> resolution-index: 0;
+    in-out property <int> enc-index: 0;
+    in-out property <bool> two-pass: false;
+    in-out property <string> output-dir: "";
+
+    // Обновления.
+    in property <string> version-label: "";
+    in-out property <bool> update-available: false;
+    in-out property <string> update-note: "";
+
+    // Списки (энкодеры приходят из Rust, остальные — статические).
+    in property <[string]> profile-models: ["Качество", "Баланс", "Скорость"];
+    in property <[string]> preset-models: ["veryfast", "faster", "medium", "slow"];
+    in property <[string]> resolution-models: ["Как есть", "Авто", "2160p", "1440p", "1080p", "720p", "480p"];
+    in property <[string]> encoder-models: ["libx264"];
+
+    // Колбеки.
+    callback pick-files();
+    callback pick-folder();
+    callback pick-output-folder();
+    callback clear-files();
+    callback start-job();
+    callback cancel-job();
+    callback mode-changed(bool);
+    callback check-updates();
+    callback install-update();
+
+    VerticalBox {
+        padding: 18px;
+        spacing: 12px;
+
+        // ---------------------------------------------------------- //
+        //  Шапка: заголовок + переключатель режима                   //
+        // ---------------------------------------------------------- //
+        HorizontalBox {
+            padding: 0;
+            spacing: 16px;
+            VerticalBox {
+                padding: 0;
+                spacing: 2px;
+                alignment: center;
+                Text {
+                    text: "Video Compressor";
+                    color: Palette.text;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Сжатие видео до нужного размера";
+                    color: Palette.text-muted;
+                    font-size: 12px;
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            ModeSwitch {
+                advanced: root.advanced;
+                changed(adv) => {
+                    root.advanced = adv;
+                    root.basic-open = true;
+                    root.mode-changed(adv);
+                }
+            }
+        }
+
+        // ---------------------------------------------------------- //
+        //  Файлы: инструменты + drop-зона + список                   //
+        // ---------------------------------------------------------- //
+        Rectangle {
+            vertical-stretch: 1;
+            border-radius: 10px;
+            background: Palette.panel;
+            border-width: 1px;
+            border-color: Palette.border;
+            VerticalBox {
+                padding: 14px;
+                spacing: 10px;
+                HorizontalBox {
+                    padding: 0;
+                    spacing: 8px;
+                    Text {
+                        text: root.files-label;
+                        color: Palette.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    VcToolButton { caption: "Добавить файлы"; enabled: !root.busy; clicked => { root.pick-files(); } }
+                    VcToolButton { caption: "Папка"; enabled: !root.busy; clicked => { root.pick-folder(); } }
+                    VcToolButton { caption: "Очистить"; enabled: root.file-count > 0 && !root.busy; clicked => { root.clear-files(); } }
+                }
+                if root.file-count == 0: DropZone { open-files => { root.pick-files(); } }
+                if root.file-count > 0: DropZone { compact: true; open-files => { root.pick-files(); } }
+                if root.file-count > 0: Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 8px;
+                    background: Palette.bg;
+                    clip: true;
+                    ListView {
+                        x: 4px;
+                        y: 4px;
+                        width: parent.width - 8px;
+                        height: parent.height - 8px;
+                        for file in files: FileRowItem {
+                            name: file.name;
+                            meta: file.meta;
+                            state: file.state;
+                            status: file.status;
+                            frac: file.frac;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------- //
+        //  Настройки: целевой размер, режимы, панель параметров      //
+        // ---------------------------------------------------------- //
+        Rectangle {
+            border-radius: 10px;
+            background: Palette.panel;
+            border-width: 1px;
+            border-color: Palette.border;
+            VerticalBox {
+                padding: 14px;
+                spacing: 10px;
+
+                HorizontalBox {
+                    padding: 0;
+                    spacing: 12px;
+                    Text {
+                        text: "Настройки";
+                        color: Palette.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    if !root.advanced: Rectangle {
+                        width: 210px;
+                        height: 24px;
+                        tb := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.basic-open = !root.basic-open; }
+                        }
+                        Text {
+                            text: root.basic-open ? "Основные параметры ▴" : "Основные параметры ▾";
+                            color: Palette.accent;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                // Целевой размер — виден всегда, без захода в настройки (§4.1).
+                HorizontalBox {
+                    padding: 0;
+                    spacing: 12px;
+                    Text {
+                        text: "Целевой размер, МБ:";
+                        color: Palette.text-muted;
+                        width: 150px;
+                        vertical-alignment: center;
+                    }
+                    SpinBox {
+                        width: 150px;
+                        minimum: 1;
+                        maximum: 100000;
+                        value <=> root.size-mb;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                // Профиль качества — простой режим (§5.1).
+                if !root.advanced: HorizontalBox {
+                    padding: 0;
+                    spacing: 12px;
+                    Text {
+                        text: "Профиль качества:";
+                        color: Palette.text-muted;
+                        width: 150px;
+                        vertical-alignment: center;
+                    }
+                    ComboBox {
+                        width: 240px;
+                        model: root.profile-models;
+                        current-index <=> root.profile-index;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                // Профиль скорости — расширенный режим (§5.3).
+                if root.advanced: HorizontalBox {
+                    padding: 0;
+                    spacing: 12px;
+                    Text {
+                        text: "Профиль скорости:";
+                        color: Palette.text-muted;
+                        width: 150px;
+                        vertical-alignment: center;
+                    }
+                    ComboBox {
+                        width: 240px;
+                        model: root.preset-models;
+                        current-index <=> root.preset-index;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                // Сворачиваемая панель основных параметров: в простом
+                // режиме скрывается, в расширенном видна всегда.
+                if root.advanced || root.basic-open: VerticalBox {
+                    padding: 2px;
+                    spacing: 10px;
+                    HorizontalBox {
+                        padding: 0;
+                        spacing: 12px;
+                        Text {
+                            text: "Кодер:";
+                            color: Palette.text-muted;
+                            width: 150px;
+                            vertical-alignment: center;
+                        }
+                        ComboBox {
+                            width: 240px;
+                            model: root.encoder-models;
+                            current-index <=> root.enc-index;
+                        }
+                        Text {
+                            text: root.encoder-note;
+                            color: root.has-ffmpeg ? Palette.ok : Palette.warn;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                    HorizontalBox {
+                        padding: 0;
+                        spacing: 12px;
+                        Text {
+                            text: "Макс. разрешение:";
+                            color: Palette.text-muted;
+                            width: 150px;
+                            vertical-alignment: center;
+                        }
+                        ComboBox {
+                            width: 240px;
+                            model: root.resolution-models;
+                            current-index <=> root.resolution-index;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    CheckBox {
+                        text: "Двухпроходное кодирование (точнее размер, дольше)";
+                        checked <=> root.two-pass;
+                    }
+                    HorizontalBox {
+                        padding: 0;
+                        spacing: 12px;
+                        Text {
+                            text: "Папка результата:";
+                            color: Palette.text-muted;
+                            width: 150px;
+                            vertical-alignment: center;
+                        }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            placeholder-text: "Рядом с исходными файлами";
+                            text <=> root.output-dir;
+                        }
+                        VcToolButton { caption: "Обзор…"; clicked => { root.pick-output-folder(); } }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------- //
+        //  Dock: статус + прогресс + главное действие                //
+        // ---------------------------------------------------------- //
+        Rectangle {
+            height: 96px;
+            border-radius: 10px;
+            background: Palette.panel;
+            border-width: 1px;
+            border-color: Palette.border;
+            HorizontalBox {
+                padding: 14px;
+                spacing: 16px;
+                VerticalBox {
+                    padding: 0;
+                    spacing: 6px;
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: root.status-text;
+                        color: Palette.text;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                    if root.busy: Rectangle {  // общий прогресс
+                        height: 6px;
+                        border-radius: 3px;
+                        background: Palette.surface2;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * root.dock-frac;
+                            border-radius: 3px;
+                            background: Palette.accent;
+                        }
+                    }
+                    Text {
+                        text: root.has-ffmpeg ? "FFmpeg: найден" : "FFmpeg: не найден — сжатие недоступно";
+                        color: root.has-ffmpeg ? Palette.text-muted : Palette.err;
+                        font-size: 12px;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                }
+                if root.busy: VcToolButton {
+                    caption: "Отмена";
+                    height: 42px;
+                    clicked => { root.cancel-job(); }
+                }
+                VcPrimaryButton {
+                    caption: root.busy ? "Кодирование…" : "Сжать";
+                    enabled: !root.busy && root.file-count > 0 && root.has-ffmpeg;
+                    clicked => { root.start-job(); }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------- //
+        //  Футер: версия + авто-обновление                           //
+        // ---------------------------------------------------------- //
+        HorizontalBox {
+            padding: 0;
+            spacing: 12px;
+            Text {
+                text: root.version-label;
+                color: Palette.text-muted;
+                font-size: 12px;
+                vertical-alignment: center;
+                height: 28px;
+            }
+            VcToolButton {
+                caption: "Проверить обновления";
+                height: 28px;
+                clicked => { root.check-updates(); }
+            }
+            if root.update-available: VcPrimaryButton {
+                caption: "Установить";
+                secondary: true;
+                height: 30px;
+                clicked => { root.install-update(); }
+            }
+            Text {
+                text: root.update-note;
+                color: root.update-available ? Palette.accent : Palette.text-muted;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}

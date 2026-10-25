@@ -3,7 +3,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod core;
 mod settings;
 
 use eframe::egui;
@@ -29,7 +28,6 @@ fn main() -> eframe::Result<()> {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .write(true)
             .open(&log)
             .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
     }));

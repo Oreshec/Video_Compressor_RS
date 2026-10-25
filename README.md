@@ -35,23 +35,26 @@
 ## 🧪 Разработка
 
 ```bash
-cargo test            # 16 тестов: математика, парсеры, дымки с реальным ffmpeg
+cargo test            # 16 тестов: математика, парсеры, дымы с реальным ffmpeg
 cargo build --release # target/release/VideoCompressor.exe
 ```
+
+Дальнейшее развитие (переезд на Slint, очередь, профили, MKV/HEVC/AV1) описано
+в [SPEC.md](SPEC.md) — ТЗ v0.2.
 
 Структура:
 
 ```
-src/
-├── main.rs          точка входа: окно, DPI, шрифт Segoe UI
-├── app.rs           вся вёрстка egui и оркестрация задач
-├── settings.rs      загрузка/сохранение настроек
-└── core/
-    ├── presets.rs   константы, пресеты скорости/кодеров, расширения
-    ├── bitrate.rs   расчёт планов, авторесолюшн
-    ├── probe.rs     ffprobe JSON → MediaInfo
-    ├── ffmpeg.rs    поиск ffmpeg/ffprobe, детект кодеров
-    └── encode.rs    команды ffmpeg, прогоны, прогресс, отмена
+vc-core/          ядро сжатия: библиотека без UI-зависимостей
+├── presets.rs    константы, пресеты скорости/кодеров, расширения
+├── bitrate.rs    расчёт планов, авторесолюшн (арифметика — в байтах)
+├── probe.rs      ffprobe JSON → MediaInfo
+├── ffmpeg.rs     поиск ffmpeg/ffprobe, детект кодеров
+└── encode.rs     команды ffmpeg, прогоны, прогресс, отмена
+app/              приложение (egui)
+├── main.rs       точка входа: окно, DPI, шрифт Segoe UI
+├── app.rs        вся вёрстка egui и оркестрация задач
+└── settings.rs   загрузка/сохранение настроек
 ```
 
 ## ❓ Как это работает

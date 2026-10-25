@@ -1,0 +1,10 @@
+[package]
+name = "vc-core"
+version = "0.1.0"
+edition = "2021"
+description = "Ядро сжатия видео: расчёты, ffprobe-анализ, кодирование через FFmpeg"
+publish = false
+
+[dependencies]
+serde_json = "1"
+thiserror = "1.0"

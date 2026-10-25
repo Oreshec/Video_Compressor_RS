@@ -1,0 +1,32 @@
+name: Release
+
+# Релиз по тегу: v1.2.3 → GitHub Release + бинарники для авто-обновления.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Тесты
+        run: cargo test --workspace
+      - name: Сборка релиза
+        run: cargo build --release
+      - name: Подготовка ассетов (имя с target-триплетом — по нему ищет авто-обновление)
+        run: |
+          Copy-Item target/release/vc-ui.exe vc-ui-x86_64-pc-windows-msvc.exe
+          Copy-Item target/release/VideoCompressor.exe VideoCompressor-x86_64-pc-windows-msvc.exe
+      - name: Публикация релиза
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            vc-ui-x86_64-pc-windows-msvc.exe
+            VideoCompressor-x86_64-pc-windows-msvc.exe
+          generate_release_notes: true
