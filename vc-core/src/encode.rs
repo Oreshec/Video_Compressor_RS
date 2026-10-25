@@ -64,6 +64,15 @@ impl CoreError {
                     .find("FFmpeg завершился с ошибкой: ")
                     .map(|i| &s[i + "FFmpeg завершился с ошибкой: ".len()..])
                     .unwrap_or(s);
+                // Типовые отказы ОС — человекочитаемым текстом: строки ffmpeg
+                // техничны, а пользователю важно знать, что делать.
+                if s.contains("Permission denied") {
+                    return format!(
+                        "Ошибка {codec}: отказано в доступе — файл может быть открыт \
+                         в другой программе или папка защищена. Укажите другую \
+                         папку вывода"
+                    );
+                }
                 const MAX: usize = 140;
                 let mut brief: String = s.chars().take(MAX).collect();
                 if s.chars().count() > MAX {
@@ -256,6 +265,26 @@ fn drain_stderr<R: BufRead>(mut reader: R, tail: Arc<Mutex<Vec<String>>>) {
 }
 
 /// Один прогон ffmpeg. Ошибка/отмена → CoreError.
+///
+/// Тело сообщения об ошибке: ПОСЛЕДНИЕ до [`MAX_TAIL`] содержательных строк
+/// stderr, разделённые ` | `. Чистая функция — не зависит от потоков, поэтому
+/// покрыта юнит-тестами отдельно от самого прогона.
+const MAX_TAIL: usize = 10;
+fn tail_detail(stderr_lines: &[String]) -> String {
+    let meaningful: Vec<&str> = stderr_lines
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let start = meaningful.len().saturating_sub(MAX_TAIL);
+    let joined = meaningful[start..].join(" | ");
+    if joined.is_empty() {
+        "неизвестная ошибка".into()
+    } else {
+        joined
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_once(
     paths: &FfmpegPaths,
@@ -364,10 +393,12 @@ fn encode_once(
         return Err(CoreError::Cancelled);
     }
     if !status.success() {
+        // В сообщение идут ПОСЛЕДНИЕ до 10 содержательных строк stderr —
+        // одной последней строки часто не хватает (суть выше в стеке).
         let detail = stderr_tail
             .lock()
             .ok()
-            .and_then(|list| list.iter().rev().find(|l| !l.trim().is_empty()).cloned())
+            .map(|list| tail_detail(&list))
             .unwrap_or_else(|| "неизвестная ошибка".into());
         return Err(CoreError::Encode {
             codec: encoder.into(),
@@ -588,6 +619,91 @@ mod tests {
     }
 
     #[test]
+    fn tail_detail_joins_last_lines() {
+        let lines: Vec<String> = (1..=10).map(|i| format!("строка{i}")).collect();
+        assert_eq!(tail_detail(&lines), lines.join(" | "));
+    }
+
+    #[test]
+    fn tail_detail_keeps_only_last_ten() {
+        let lines: Vec<String> = (1..=12).map(|i| format!("строка{i}")).collect();
+        assert_eq!(tail_detail(&lines), lines[2..].join(" | "));
+    }
+
+    #[test]
+    fn tail_detail_skips_empty_and_blank_lines() {
+        let lines = vec![
+            String::new(),
+            "  ".to_string(),
+            "a".to_string(),
+            "".to_string(),
+            "b".to_string(),
+        ];
+        assert_eq!(tail_detail(&lines), "a | b");
+    }
+
+    #[test]
+    fn tail_detail_empty_is_unknown_error() {
+        assert_eq!(tail_detail(&[]), "неизвестная ошибка");
+        assert_eq!(tail_detail(&[String::new(), " \t".into()]), "неизвестная ошибка");
+    }
+
+    #[test]
+    fn short_message_permission_denied_is_human_readable() {
+        let e = CoreError::Encode {
+            codec: "h264_nvenc".into(),
+            stderr: format!(
+                "FFmpeg завершился с ошибкой: [out#0/mp4] Error opening output {} \
+                 Permission denied",
+                "C:\\video\\out.mp4"
+            ),
+        };
+        let msg = e.short_message();
+        assert!(msg.contains("h264_nvenc"), "нет кодека: {msg}");
+        assert!(msg.contains("отказано в доступе"), "нет человеческого текста: {msg}");
+        // Технический мусор не должен просочиться в баннер.
+        assert!(!msg.contains("Error opening output"), "техностиль: {msg}");
+    }
+
+    #[test]
+    fn short_message_truncates_long_stderr() {
+        let long = "x".repeat(400);
+        let e = CoreError::Encode {
+            codec: "libx264".into(),
+            stderr: format!("FFmpeg завершился с ошибкой: {long}"),
+        };
+        let msg = e.short_message();
+        assert!(msg.chars().count() < 200, "слишком длинно: {:?}", msg.len());
+        assert!(msg.ends_with('…'));
+    }
+
+    #[test]
+    fn short_message_simple_variants() {
+        assert_eq!(
+            CoreError::FfmpegNotFound("нет".into()).short_message(),
+            "FFmpeg не найден"
+        );
+        assert_eq!(CoreError::Cancelled.short_message(), "Отменено");
+        assert_eq!(CoreError::InvalidTargetSize.short_message(), "Неверный размер");
+        assert!(
+            CoreError::InputNotFound(PathBuf::from("a.mp4"))
+                .short_message()
+                .contains("Файл не найден")
+        );
+    }
+
+    #[test]
+    fn recoverable_only_encode_and_disk_full() {
+        assert!(CoreError::DiskFull {
+            needed_mb: 1.0,
+            available_mb: 0.0
+        }
+        .is_recoverable());
+        assert!(!CoreError::Cancelled.is_recoverable());
+        assert!(!CoreError::InvalidTargetSize.is_recoverable());
+    }
+
+    #[test]
     fn output_path_with_dir() {
         let (input, out_dir, prefix) = if cfg!(windows) {
             (Path::new(r"C:\vid\clip.mp4"), r"D:\small", "D:\\")
@@ -608,6 +724,30 @@ mod tests {
             out.display()
         );
         assert_eq!(out.file_name().unwrap().to_string_lossy(), "clip_compressed.mp4");
+    }
+
+    #[test]
+    fn output_path_blank_dir_falls_back_to_input_folder() {
+        let input = if cfg!(windows) {
+            Path::new(r"C:\vid\clip.mp4")
+        } else {
+            Path::new("/tmp/vid/clip.mp4")
+        };
+        // Пустая и пробельная строка равны «папка входных файлов».
+        for dir in ["", "   "] {
+            let out = default_output_path(input, Some(dir));
+            let parent = out.parent().unwrap();
+            assert_eq!(
+                parent,
+                input.parent().unwrap(),
+                "пустая папка должна откатываться к папке входа: {}",
+                dir
+            );
+            assert_eq!(
+                out.file_name().unwrap().to_string_lossy(),
+                "clip_compressed.mp4"
+            );
+        }
     }
 
     /// Интеграционный тест по гвардии pytest-фиков: probe реального образца,

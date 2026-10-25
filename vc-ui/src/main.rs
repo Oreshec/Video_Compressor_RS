@@ -18,15 +18,12 @@ slint::include_modules!();
 
 use vc_core::{find_ffmpeg, probe, usable_encoders, CompressionResult, CoreError, FfmpegPaths};
 
-// ------------------------------------------------------------------ //
-//  Авто-обновление: GitHub Releases (self_update).                    //
-//  Проверка — тихо при старте и по кнопке; установка — по кнопке.      //
-// ------------------------------------------------------------------ //
+mod logging;
+mod updates;
+#[cfg(windows)]
+mod win_drop;
 
-const REPO_OWNER: &str = "Oreshec";
-const REPO_NAME: &str = "Video_Compressor_RS";
-const BIN_NAME: &str = "vc-ui";
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+use updates::{spawn_update_check, spawn_update_install, CURRENT_VERSION};
 
 /// Прототип: программный рендерер без зависимости от GL/D3D на машине.
 /// (femtovg на этой машине даёт пустое белое окно; revisear при оптимизации.)
@@ -34,134 +31,12 @@ fn force_software_renderer() {
     std::env::set_var("SLINT_BACKEND", "winit-software");
 }
 
-/// Консоли у приложения нет (`windows_subsystem = "windows"`) — паники пишем
-/// в `panic.log` рядом с exe, чтобы диагностика не терялась.
+/// Паники — в общий лог (консоли нет).
 fn install_panic_log() {
     std::panic::set_hook(Box::new(|info| {
-        let stamp = chrono_like_stamp();
-        let text = format!("[{stamp}] {info}\n{info:#?}\n");
-        let path = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|d| d.join("panic.log")));
-        if let Some(path) = path {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = f.write_all(text.as_bytes());
-            }
-        }
+        logging::log(&format!("PANIC: {info}"));
+        logging::log(&format!("{info:#?}"));
     }));
-}
-
-/// `2026-10-25 12:34:56 UTC` без внешних крейтов.
-fn chrono_like_stamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = secs / 86400;
-    let (y, m, d) = civil_from_days(days as i64);
-    let tod = secs % 86400;
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
-        tod / 3600,
-        (tod % 3600) / 60,
-        tod % 60
-    )
-}
-
-/// Дни с эпохи → (год, месяц, день). Алгоритм Говарда Хиннанта.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-fn github_update(unattended: bool) -> Result<self_update::backends::github::Update, String> {
-    let mut builder = self_update::backends::github::Update::configure();
-    if unattended {
-        builder.unattended();
-    }
-    builder
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
-        .current_version(CURRENT_VERSION)
-        .bin_name(BIN_NAME)
-        .build()
-        .map_err(|e| e.to_string())
-}
-
-/// Проверка наличия новой версии (без установки). `quiet` — не ругаться
-/// на сетевые ошибки при тихой проверке при старте.
-fn spawn_update_check(weak: slint::Weak<MainWindow>, quiet: bool) {
-    std::thread::spawn(move || {
-        let result = github_update(true)
-            .and_then(|u| u.is_update_available().map_err(|e| e.to_string()));
-        let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok(Some(release)) => {
-                ui.set_update_available(true);
-                ui.set_update_note(
-                    format!("Доступно обновление: v{} — нажмите «Установить»", release.version())
-                        .into(),
-                );
-            }
-            Ok(None) => {
-                ui.set_update_available(false);
-                ui.set_update_note("У вас самая свежая версия".into());
-            }
-            Err(e) => {
-                ui.set_update_available(false);
-                if !quiet {
-                    ui.set_update_note(
-                        format!("Не удалось проверить обновления: {e}").into(),
-                    );
-                }
-            }
-        });
-    });
-}
-
-/// Установка обновления: скачать релиз, заменить exe, перезапуститься.
-fn spawn_update_install(weak: slint::Weak<MainWindow>) {
-    ui_note(&weak, "Устанавливаем обновление…".into());
-    std::thread::spawn(move || {
-        let result = github_update(true)
-            .and_then(|u| u.update().map_err(|e| e.to_string()));
-        let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok(status) if status.is_updated() => {
-                ui.set_update_note(
-                    format!("Установлена версия {} — перезапускаем…", status.version()).into(),
-                );
-                // Перезапуск: уже установленная новая сборка подхватится сама.
-                restart_app();
-            }
-            Ok(_status) => {
-                ui.set_update_available(false);
-                ui.set_update_note("Обновление не требуется".into());
-            }
-            Err(e) => {
-                ui.set_update_note(format!("Ошибка обновления: {e}").into());
-            }
-        });
-    });
-}
-
-fn ui_note(weak: &slint::Weak<MainWindow>, text: slint::SharedString) {
-    let _ = weak.upgrade_in_event_loop(move |ui| ui.set_update_note(text));
-}
-
-/// Запустить новую копию и аккуратно закрыть текущую.
-fn restart_app() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).spawn();
-    }
-    let _ = slint::quit_event_loop();
 }
 
 /// Константы простого режима (SPEC §5.1, §7.3): перевод МБ ↔ байты — на границе UI.
@@ -276,6 +151,7 @@ fn add_files(
     paths: Vec<PathBuf>,
 ) {
     for path in paths {
+        logging::log(&format!("файл добавлен: {}", path.display()));
         let mut items = match hub.items.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -306,6 +182,19 @@ fn add_files(
         let hub2 = Arc::clone(hub);
         std::thread::spawn(move || {
             let info = probe(&ffmpeg, &path2).ok();
+            match &info {
+                Some(i) => logging::log(&format!(
+                    "probe {}: {} с · {} байт · {}{}",
+                    path2.display(),
+                    i.duration_sec,
+                    i.size_bytes,
+                    i.resolution(),
+                    i.fps
+                        .map(|f| format!(" · {f:.3} fps"))
+                        .unwrap_or_default()
+                )),
+                None => logging::log(&format!("probe {} не удался", path2.display())),
+            }
             let _ = hub2.items.lock().map(|mut list| {
                 if let Some(item) = list.get_mut(idx) {
                     if item.path == path2 {
@@ -380,6 +269,10 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
                 .collect()
         })
         .unwrap_or_default();
+    logging::log(&format!(
+        "job: файлов в очереди {}",
+        jobs.len()
+    ));
 
     ui.set_busy(true);
     ui.set_dock_frac(0.0);
@@ -414,6 +307,10 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
     let two_pass = ui.get_two_pass();
     let target_bytes = (ui.get_size_mb().max(0) as u64) * 1024 * 1024;
     let out_dir = ui.get_output_dir().to_string();
+    logging::log(&format!(
+        "job: профиль='{}', кодер={}, целевой размер={} МБ, макс-высота={:?}, two_pass={}, папка='{}'",
+        preset, encoder, target_bytes / 1024 / 1024, max_height, two_pass, out_dir
+    ));
 
     let cancel = hub.reset_cancel();
     let weak = ui.as_weak();
@@ -444,6 +341,11 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
             };
 
             let output = vc_core::default_output_path(&path, Some(&out_dir));
+            logging::log(&format!(
+                "job: файл {} → выход {}",
+                path.display(),
+                output.display()
+            ));
 
             let weak2 = weak.clone();
             let progress: Option<&vc_core::encode::ProgressCb> =
@@ -491,6 +393,17 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
                 Err(CoreError::Cancelled) => (5, "Отменено".to_string(), None),
                 Err(e) => (4, e.short_message(), Some(e.message())),
             };
+            match &result {
+                Ok(res) => logging::log(&format!(
+                    "job: готово {} → {} · {:.1} МБ · попыток {} · кодер {}",
+                    path.display(),
+                    res.output_path.display(),
+                    res.actual_size_mb,
+                    res.attempts,
+                    res.encoder
+                )),
+                Err(e) => logging::log(&format!("job: ошибка {}: {e}", path.display())),
+            }
             let _ = weak3.upgrade_in_event_loop(move |ui| {
                 let model = ui.get_files();
                 if let Some(mut old_row) = model.row_data(idx) {
@@ -534,6 +447,12 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
 fn main() {
     install_panic_log();
     force_software_renderer();
+    logging::log(&format!(
+        "=== старт vc-ui {CURRENT_VERSION} (SLINT_BACKEND={:?}, advanced={:?}, basic-open={:?}) ===",
+        std::env::var("SLINT_BACKEND").ok(),
+        std::env::var("VC_UI_ADVANCED").ok(),
+        std::env::var("VC_UI_BASIC_OPEN").ok(),
+    ));
     let app = MainWindow::new().expect("Не удалось создать окно");
 
     // Версия + авто-обновление.
@@ -563,11 +482,20 @@ fn main() {
         }
         .into(),
     );
+    logging::log(&format!(
+        "ffmpeg: {}",
+        ffmpeg
+            .as_ref()
+            .map(|f| f.ffmpeg.display().to_string())
+            .unwrap_or_else(|| "не найден".into())
+    ));
+    if !encoders.is_empty() {
+        logging::log(&format!("доступные кодеры: {}", encoders.join(", ")));
+    }
 
     // Модель строк списка.
     let model: Rc<VecModel<FileInfo>> = Rc::new(VecModel::default());
     app.set_files(model.clone().into());
-
     // Модели списков настроек.
     app.set_profile_models(
         Rc::new(VecModel::from(
@@ -670,8 +598,14 @@ fn main() {
     });
     let ui = app.as_weak();
     app.on_install_update(move || {
+        logging::log("updates: установка запущена пользователем");
         spawn_update_install(ui.unwrap().as_weak());
     });
 
+    // Drag&drop из ОС (Slint пока не передаёт WM_DROPFILES — см. win_drop).
+    #[cfg(windows)]
+    win_drop::install(&app, &model, &hub);
+
     app.run().unwrap();
+    logging::log("=== приложение закрыто ===");
 }

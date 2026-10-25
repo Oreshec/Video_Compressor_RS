@@ -12,5 +12,13 @@ rfd = "0.17"
 self_update = { version = "1", default-features = false, features = ["github", "reqwest", "native-tls"] }
 vc-core = { path = "../vc-core" }
 
+# Drag&drop из ОС: Slint 1.x пока не передаёт WM_DROPFILES (см. src/win_drop.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [build-dependencies]
 slint-build = "1.18"
