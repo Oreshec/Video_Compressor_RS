@@ -50,12 +50,31 @@ impl CoreError {
         )
     }
 
-    /// Короткое сообщение для UI (баннер).
+    /// Короткое сообщение для UI (баннер): кодек + суть ошибки.
     pub fn short_message(&self) -> String {
         match self {
             CoreError::FfmpegNotFound(_) => "FFmpeg не найден".into(),
             CoreError::MediaInfo(s) => format!("Ошибка анализа: {s}"),
-            CoreError::Encode { codec, .. } => format!("Ошибка {codec}"),
+            CoreError::Encode { codec, stderr } => {
+                // Суть — последняя содержательная строка stderr, а не только
+                // имя кодека: иначе пользователь видит «Ошибка libx264», хотя
+                // кодек только что был другим.
+                let s = stderr.trim();
+                let s = s
+                    .find("FFmpeg завершился с ошибкой: ")
+                    .map(|i| &s[i + "FFmpeg завершился с ошибкой: ".len()..])
+                    .unwrap_or(s);
+                const MAX: usize = 140;
+                let mut brief: String = s.chars().take(MAX).collect();
+                if s.chars().count() > MAX {
+                    brief.push('…');
+                }
+                if brief.is_empty() {
+                    format!("Ошибка кодирования: {codec}")
+                } else {
+                    format!("Ошибка {codec}: {brief}")
+                }
+            }
             CoreError::Cancelled => "Отменено".into(),
             CoreError::PathConflict(_) => "Конфликт путей".into(),
             CoreError::DiskFull { .. } => "Нет места на диске".into(),
@@ -496,15 +515,32 @@ pub fn compress(
             Err(CoreError::Cancelled)
         }
         Err(e) => {
-            if !cancel.load(Ordering::Relaxed) && encoder != "libx264" {
-                // Аппаратный кодер не сработал — повтор через libx264.
-                return run_attempts(
-                    paths, &info, &output, target_size_bytes, preset, "libx264",
-                    max_height, two_pass, MAX_ATTEMPTS, progress, cancel,
-                );
+            if cancel.load(Ordering::Relaxed) || encoder == "libx264" {
+                let _ = std::fs::remove_file(&output);
+                return Err(e);
             }
-            let _ = std::fs::remove_file(&output);
-            Err(e)
+            // Аппаратный кодер не сработал — повтор через libx264. Откат
+            // прозрачный: успешный результат честно именует резерв, а при
+            // неудаче пользователь видит ОБЕ ошибки, а не только последнюю.
+            match run_attempts(
+                paths, &info, &output, target_size_bytes, preset, "libx264",
+                max_height, two_pass, MAX_ATTEMPTS, progress, cancel,
+            ) {
+                Ok(res) => Ok(res),
+                Err(CoreError::Cancelled) => {
+                    let _ = std::fs::remove_file(&output);
+                    Err(CoreError::Cancelled)
+                }
+                Err(fb_err) => {
+                    let _ = std::fs::remove_file(&output);
+                    Err(CoreError::Encode {
+                        codec: format!("{encoder} → резерв libx264"),
+                        stderr: format!(
+                            "Выбранный кодер не сработал: {e}; резерв тоже: {fb_err}"
+                        ),
+                    })
+                }
+            }
         }
     }
 }

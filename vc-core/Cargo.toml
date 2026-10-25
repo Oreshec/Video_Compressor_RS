@@ -1,6 +1,6 @@
 [package]
 name = "vc-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Ядро сжатия видео: расчёты, ffprobe-анализ, кодирование через FFmpeg"
 publish = false

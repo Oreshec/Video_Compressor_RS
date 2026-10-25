@@ -1,6 +1,8 @@
 name: Release
 
-# Релиз по тегу: v1.2.3 → GitHub Release + бинарники для авто-обновления.
+# Релиз по тегу: v0.2.0 → GitHub Release + бинарник для авто-обновления.
+# Тег обязан совпадать с [workspace.package] version в корневом Cargo.toml
+# (источник номера — VERSIONING.md); иначе сборка ломается проверкой ниже.
 on:
   push:
     tags: ["v*"]
@@ -15,18 +17,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Тег соответствует версии проекта
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $line = Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $line) { Write-Error "В корневом Cargo.toml нет [workspace.package] version"; exit 1 }
+          $ver = $line.Matches[0].Groups[1].Value
+          if ($tag -ne "v$ver") {
+            Write-Error "Тег '$tag' не совпадает с версией 'v$ver' из Cargo.toml. Подними версию в [workspace.package] и закоммить, затем перевешивай тег."
+          }
       - name: Тесты
         run: cargo test --workspace
       - name: Сборка релиза
         run: cargo build --release
-      - name: Подготовка ассетов (имя с target-триплетом — по нему ищет авто-обновление)
-        run: |
-          Copy-Item target/release/vc-ui.exe vc-ui-x86_64-pc-windows-msvc.exe
-          Copy-Item target/release/VideoCompressor.exe VideoCompressor-x86_64-pc-windows-msvc.exe
+      - name: Подготовка ассета (имя с target-триплетом — по нему ищет авто-обновление)
+        run: Copy-Item target/release/vc-ui.exe vc-ui-x86_64-pc-windows-msvc.exe
       - name: Публикация релиза
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            vc-ui-x86_64-pc-windows-msvc.exe
-            VideoCompressor-x86_64-pc-windows-msvc.exe
+          files: vc-ui-x86_64-pc-windows-msvc.exe
           generate_release_notes: true

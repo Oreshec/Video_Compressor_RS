@@ -2,7 +2,9 @@
 //!
 //! UI не вызывает FFmpeg напрямую и не считает параметры — всё через `vc-core`.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// GUI-приложение: без консоли в любом сборке. Вывод паник идёт в panic.log
+// (install_panic_log), поэтому диагностика не теряется.
+#![windows_subsystem = "windows"]
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -30,6 +32,55 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (femtovg на этой машине даёт пустое белое окно; revisear при оптимизации.)
 fn force_software_renderer() {
     std::env::set_var("SLINT_BACKEND", "winit-software");
+}
+
+/// Консоли у приложения нет (`windows_subsystem = "windows"`) — паники пишем
+/// в `panic.log` рядом с exe, чтобы диагностика не терялась.
+fn install_panic_log() {
+    std::panic::set_hook(Box::new(|info| {
+        let stamp = chrono_like_stamp();
+        let text = format!("[{stamp}] {info}\n{info:#?}\n");
+        let path = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("panic.log")));
+        if let Some(path) = path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = f.write_all(text.as_bytes());
+            }
+        }
+    }));
+}
+
+/// `2026-10-25 12:34:56 UTC` без внешних крейтов.
+fn chrono_like_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let (y, m, d) = civil_from_days(days as i64);
+    let tod = secs % 86400;
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// Дни с эпохи → (год, месяц, день). Алгоритм Говарда Хиннанта.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn github_update(unattended: bool) -> Result<self_update::backends::github::Update, String> {
@@ -431,9 +482,10 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
             let result_ok = result.is_ok();
             // Формируем строки статуса на потоке задачи: замыкание должно быть 'static.
             let (state, status, err_full) = match &result {
+                // В статусе — фактический кодер: при откате на резерв видно, чем сжали.
                 Ok(res) => (
                     3i32,
-                    format!("Готово · {:.1} МБ", res.actual_size_mb),
+                    format!("Готово · {:.1} МБ · {}", res.actual_size_mb, res.encoder),
                     None,
                 ),
                 Err(CoreError::Cancelled) => (5, "Отменено".to_string(), None),
@@ -480,6 +532,7 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
 }
 
 fn main() {
+    install_panic_log();
     force_software_renderer();
     let app = MainWindow::new().expect("Не удалось создать окно");
 

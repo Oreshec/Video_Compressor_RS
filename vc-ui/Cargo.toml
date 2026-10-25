@@ -1,6 +1,6 @@
 [package]
 name = "vc-ui"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Прототип интерфейса на Slint (SPEC v0.2, Этап 1)"
 publish = false

@@ -2,6 +2,12 @@
 members = ["vc-core", "app", "vc-ui"]
 resolver = "2"
 
+# Единственный источник номера версии проекта. Крейты наследуют через
+# version.workspace = true; UI и авто-обновление берут env!("CARGO_PKG_VERSION").
+# Порядок: правим ЗДЕСЬ → коммит → тег vX.Y.Z → release.yml публикует релиз.
+[workspace.package]
+version = "0.2.0"
+
 # Профили задаются только в корне workspace.
 [profile.release]
 opt-level = 2

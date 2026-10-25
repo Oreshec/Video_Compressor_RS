@@ -1,6 +1,6 @@
 [package]
 name = "video_compressor"
-version = "2.4.0"
+version.workspace = true
 edition = "2021"
 description = "Сжатие видео до заданного размера (GUI на egui)"
 publish = false
