@@ -487,7 +487,8 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
 }
 
 /// Проверяет, находится ли путь внутри зоны синхронизации OneDrive
-/// (любой компонент пути равен «OneDrive», регистр не важен).
+/// (любой компонент пути равен «OneDrive», регистр и тип разделителя
+/// не важны: на Linux CI обратная косая черта не является разделителем).
 ///
 /// Зачем: на машинах со Smart App Control исполняемый файл, запущенный
 /// из OneDrive-синхронизируемой папки, теряет право записи вне неё
@@ -496,12 +497,10 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
 /// при этом пишет нормально, поэтому запрет маскируется под
 /// «прав на папку нет», хотя права всех процессов идентичны.
 fn path_under_onedrive(path: &std::path::Path) -> bool {
-    path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case("OneDrive")
-    })
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .any(|component| component.eq_ignore_ascii_case("OneDrive"))
 }
 
 fn main() {
@@ -704,6 +703,10 @@ mod onedrive_tests {
         // Проверка нечувствительна к регистру компонента.
         assert!(path_under_onedrive(Path::new(
             r"C:\Users\user\ONEDRIVE\x\vc-ui.exe"
+        )));
+        // Проверка нечувствительна к типу разделителей пути.
+        assert!(path_under_onedrive(Path::new(
+            "/home/user/OneDrive/Desktop/vc-ui.exe"
         )));
         // UNC-префикс пути не должен ломать проверку остальных компонентов.
         assert!(path_under_onedrive(Path::new(
