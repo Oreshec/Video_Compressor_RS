@@ -250,6 +250,45 @@ fn pick_folder_dialog(ui: &MainWindow, model: &Rc<VecModel<FileInfo>>, hub: &Arc
 }
 
 /// Запуск пакетного сжатия — построчно через `vc_core::compress`.
+/// Диагностика отказов записи (логируем, не мешаем пользователю):
+/// 1) создаётся ли файл в папке вывода вообще;
+/// 2) открывается ли сам целевой файл *_compressed (занят? read-only?).
+///
+/// Ответы делят «заперта папка» и «занят файл».
+fn log_write_probes(input: &Path, out_dir: &str) {
+    let target = vc_core::default_output_path(input, Some(out_dir));    let folder = target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let probe = folder.join("vc_write_probe.tmp");
+    let folder_report = match std::fs::write(&probe, b"probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            "запись в папку разрешена".to_string()
+        }
+        Err(e) => format!("запись в папку ОТКЛОНЕНА: {e}"),
+    };
+    let existed = target.is_file();
+    let file_report = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+    {
+        Ok(_) => format!(
+            "целевой файл {}открывается",
+            if existed { "уже существует и " } else { "" }
+        ),
+        Err(e) => format!(
+            "целевой файл {}НЕ открывается: {e}",
+            if existed { "существует и " } else { "" }
+        ),
+    };
+    logging::log(&format!(
+        "job: диагностика {}: {folder_report}; {file_report}",
+        folder.display()
+    ));
+}
+
 fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
     let Some(ref ffmpeg) = hub.ffmpeg else {
         ui.set_status_text("FFmpeg не найден — сжатие недоступно".into());
@@ -402,7 +441,10 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
                     res.attempts,
                     res.encoder
                 )),
-                Err(e) => logging::log(&format!("job: ошибка {}: {e}", path.display())),
+                Err(e) => {
+                    logging::log(&format!("job: ошибка {}: {e}", path.display()));
+                    log_write_probes(&path, &out_dir);
+                }
             }
             let _ = weak3.upgrade_in_event_loop(move |ui| {
                 let model = ui.get_files();

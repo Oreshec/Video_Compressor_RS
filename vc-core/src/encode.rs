@@ -39,6 +39,9 @@ pub enum CoreError {
 
     #[error("Входной файл не найден: {0}")]
     InputNotFound(PathBuf),
+
+    #[error("Целевой файл занят и не заменён ({reason}); готовый результат оставлен как {part}")]
+    OutputReplace { target: PathBuf, reason: String, part: PathBuf },
 }
 
 impl CoreError {
@@ -89,6 +92,10 @@ impl CoreError {
             CoreError::DiskFull { .. } => "Нет места на диске".into(),
             CoreError::InvalidTargetSize => "Неверный размер".into(),
             CoreError::InputNotFound(_) => "Файл не найден".into(),
+            CoreError::OutputReplace { part, .. } => format!(
+                "Готовый файл сохранён как {}\nСтарый результат занят другим процессом (проверьте OneDrive/плеер)",
+                part.display()
+            ),
         }
     }
 
@@ -515,6 +522,57 @@ fn run_attempts(
     }
 }
 
+/// Кодирование идёт во временный файл рядом с целевым: ffmpeg никогда не
+/// открывает целевой файл сам, поэтому «Permission denied» от синхронизаторов
+/// (OneDrive), которые держат старый результат, невозможен. Имя уникально на
+/// процесс: наш же «хвост» от прошлого запуска не должен блокировать новый.
+pub(crate) fn part_output_path(final_path: &Path) -> PathBuf {
+    let stem = final_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".into());
+    let ext = final_path
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mp4".into()); // расширение нужно и ffmpeg'у (муксер)
+    final_path.with_file_name(format!("{stem}.part-{}.{ext}", std::process::id()))
+}
+
+/// Заменить целевой файл результатом кодирования (та же папка → rename).
+/// Целевой может быть занят синхронизатором/плеером: несколько удалений
+/// с паузами, и только затем отказ (временный файл сохраняется).
+fn finalize_output(part: &Path, target: &Path) -> Result<(), std::io::Error> {
+    if target.exists() {
+        let mut last: Option<std::io::Error> = None;
+        for _ in 0..5 {
+            match std::fs::remove_file(target) {
+                Ok(()) => {
+                    last = None;
+                    break;
+                }
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+        if let Some(e) = last {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("целевой файл занят другим процессом ({e})"),
+            ));
+        }
+    }
+    if let Err(e) = std::fs::rename(part, target) {
+        // Напр. rename запрещён антивирусом — пробуем копирование поверх.
+        if std::fs::copy(part, target).is_err() {
+            return Err(e);
+        }
+        let _ = std::fs::remove_file(part);
+    }
+    Ok(())
+}
+
 /// Основная точка входа: сжать файл; сбой аппаратного кодера → CPU.
 #[allow(clippy::too_many_arguments)]
 pub fn compress(
@@ -535,35 +593,58 @@ pub fn compress(
     if output.canonicalize().ok() == info.path.canonicalize().ok() {
         return Err(CoreError::PathConflict(output.clone()));
     }
+    // Кодируем во временный файл: OneDrive/плееры держат старый целевой,
+    // и ffmpeg при прямой записи в него получает «Permission denied».
+    let part = part_output_path(&output);
     let result = run_attempts(
-        paths, &info, &output, target_size_bytes, preset, encoder, max_height,
+        paths, &info, &part, target_size_bytes, preset, encoder, max_height,
         two_pass, MAX_ATTEMPTS, progress, cancel,
     );
     match result {
-        Ok(res) => Ok(res),
+        Ok(res) => match finalize_output(&part, &output) {
+            Ok(()) => Ok(CompressionResult {
+                output_path: output.clone(),
+                ..res
+            }),
+            Err(e) => Err(CoreError::OutputReplace {
+                target: output,
+                reason: e.to_string(),
+                part,
+            }),
+        },
         Err(CoreError::Cancelled) => {
-            let _ = std::fs::remove_file(&output);
+            let _ = std::fs::remove_file(&part);
             Err(CoreError::Cancelled)
         }
         Err(e) => {
             if cancel.load(Ordering::Relaxed) || encoder == "libx264" {
-                let _ = std::fs::remove_file(&output);
+                let _ = std::fs::remove_file(&part);
                 return Err(e);
             }
             // Аппаратный кодер не сработал — повтор через libx264. Откат
             // прозрачный: успешный результат честно именует резерв, а при
             // неудаче пользователь видит ОБЕ ошибки, а не только последнюю.
             match run_attempts(
-                paths, &info, &output, target_size_bytes, preset, "libx264",
+                paths, &info, &part, target_size_bytes, preset, "libx264",
                 max_height, two_pass, MAX_ATTEMPTS, progress, cancel,
             ) {
-                Ok(res) => Ok(res),
+                Ok(res) => match finalize_output(&part, &output) {
+                    Ok(()) => Ok(CompressionResult {
+                        output_path: output,
+                        ..res
+                    }),
+                    Err(e2) => Err(CoreError::OutputReplace {
+                        target: output,
+                        reason: e2.to_string(),
+                        part,
+                    }),
+                },
                 Err(CoreError::Cancelled) => {
-                    let _ = std::fs::remove_file(&output);
+                    let _ = std::fs::remove_file(&part);
                     Err(CoreError::Cancelled)
                 }
                 Err(fb_err) => {
-                    let _ = std::fs::remove_file(&output);
+                    let _ = std::fs::remove_file(&part);
                     Err(CoreError::Encode {
                         codec: format!("{encoder} → резерв libx264"),
                         stderr: format!(
@@ -748,6 +829,98 @@ mod tests {
                 "clip_compressed.mp4"
             );
         }
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let name = format!("vc_final_{}_{}", std::process::id(), tag);
+        // %TEMP% может быть недоступен процессу тестов (политики окружения) —
+        // тогда общий target/ репозитория (cwd тесты меняют, поэтому от манифеста).
+        let repo_target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        for base in [std::env::temp_dir(), repo_target] {
+            let dir = base.join(&name);
+            if std::fs::create_dir_all(&dir).is_ok() {
+                return dir;
+            }
+        }
+        panic!("нет доступной для записи папки для теста {tag}");
+    }
+
+    #[test]
+    fn part_output_path_keeps_extension_for_muxer() {
+        let target = Path::new(r"C:\out\clip_compressed.mp4");
+        let part = part_output_path(target);
+        let name = part.file_name().unwrap().to_string_lossy();
+        assert_eq!(part.parent().unwrap(), target.parent().unwrap());
+        assert!(
+            name.starts_with("clip_compressed.part-") && name.ends_with(".mp4"),
+            "временное имя обязано сохранять расширение ffmpeg'у: {name}"
+        );
+        assert_ne!(part, target);
+    }
+
+    #[test]
+    fn finalize_output_replaces_existing_target() {
+        let dir = scratch_dir("repl");
+        let part = dir.join("clip.part-1.mp4");
+        let target = dir.join("clip.mp4");
+        std::fs::write(&part, b"new").unwrap();
+        std::fs::write(&target, b"old").unwrap();
+        finalize_output(&part, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!part.exists(), "временный файл обязан исчезнуть");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finalize_output_creates_absent_target() {
+        let dir = scratch_dir("absent");
+        let part = dir.join("clip.part-2.mp4");
+        let target = dir.join("clip.mp4");
+        std::fs::write(&part, b"data").unwrap();
+        finalize_output(&part, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"data");
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Занятый целевой (открыт другим процессом) → отказ, временный сохранён.
+    /// Windows-специфично: на Unix незакрытый файл удалению не мешает.
+    #[cfg(windows)]
+    #[test]
+    fn finalize_output_fails_when_target_locked() {
+        const NEW: &[u8] = b"new";
+        const OLD: &[u8] = b"old-old-old-old"; // длина отличима от NEW
+        let dir = scratch_dir("locked");
+        let part = dir.join("clip.part-3.mp4");
+        let target = dir.join("clip.mp4");
+        std::fs::write(&part, NEW).unwrap();
+        std::fs::write(&target, OLD).unwrap();
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // share_mode(0) — без совместного доступа, как хозяйский OneDrive.
+            let _keep = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&target)
+                .unwrap();
+            let err = finalize_output(&part, &target).unwrap_err();
+            assert!(
+                err.to_string().contains("занят другим процессом"),
+                "неожиданный текст ошибки: {err}"
+            );
+            assert!(part.exists(), "результат терять нельзя");
+            // Содержимое цели трогать нельзя — проверяем размер (чтение здесь
+            // заблокировано нашим же exclusive-хендлом).
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().len() as usize,
+                OLD.len(),
+                "при отказе замены целевой файл обязан остаться прежним"
+            );
+        }
+        // Держатель закрылся — теперь замена обязана пройти.
+        finalize_output(&part, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), NEW);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Интеграционный тест по гвардии pytest-фиков: probe реального образца,
