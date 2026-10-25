@@ -878,28 +878,38 @@ mod onedrive_tests {
 
     #[test]
     fn relocate_dest_joins_exe_name() {
-        assert_eq!(
-            relocate_dest(Path::new(r"C:\apps\vc-ui")),
-            PathBuf::from(r"C:\apps\vc-ui\vc-ui.exe")
-        );
+        // Платформонезависимо: литеральные пути с «\» на linux — один компонент.
+        let dir = if cfg!(windows) {
+            PathBuf::from(r"C:\apps").join("vc-ui")
+        } else {
+            PathBuf::from("/apps").join("vc-ui")
+        };
+        assert_eq!(relocate_dest(&dir), dir.join("vc-ui.exe"));
     }
 
     #[test]
     fn already_relocated_checks_destination_tree() {
-        let dir = Path::new(r"C:\apps\vc-ui");
-        assert!(already_relocated(Path::new(r"C:\apps\vc-ui\vc-ui.exe"), dir));
-        assert!(!already_relocated(
-            Path::new(r"C:\apps\vc-ui\old\vc-ui.exe"),
-            dir
-        ));
-        assert!(!already_relocated(
-            Path::new(r"C:\Users\user\repo\vc-ui\vc-ui.exe"),
-            dir
-        ));
+        let dir = if cfg!(windows) {
+            PathBuf::from(r"C:\apps").join("vc-ui")
+        } else {
+            PathBuf::from("/apps").join("vc-ui")
+        };
+        let inside = dir.join("vc-ui.exe");
+        let in_subdir = dir.join("old").join("vc-ui.exe");
+        let outside = if cfg!(windows) {
+            PathBuf::from(r"C:\apps\repo\vc-ui\vc-ui.exe")
+        } else {
+            PathBuf::from("/apps/repo/vc-ui/vc-ui.exe")
+        };
         // Имя похоже, но другой компонент каталога — не считаем «уже там».
-        assert!(!already_relocated(
-            Path::new(r"C:\apps\vc-ui-extra\vc-ui.exe"),
-            dir
-        ));
+        let similar_name = if cfg!(windows) {
+            PathBuf::from(r"C:\apps\vc-ui-extra\vc-ui.exe")
+        } else {
+            PathBuf::from("/apps/vc-ui-extra/vc-ui.exe")
+        };
+        assert!(already_relocated(&inside, &dir));
+        assert!(!already_relocated(&in_subdir, &dir));
+        assert!(!already_relocated(&outside, &dir));
+        assert!(!already_relocated(&similar_name, &dir));
     }
 }
