@@ -847,7 +847,11 @@ mod tests {
 
     #[test]
     fn part_output_path_keeps_extension_for_muxer() {
-        let target = Path::new(r"C:\out\clip_compressed.mp4");
+        let target = if cfg!(windows) {
+            Path::new(r"C:\out\clip_compressed.mp4")
+        } else {
+            Path::new("/tmp/vid/clip_compressed.mp4")
+        };
         let part = part_output_path(target);
         let name = part.file_name().unwrap().to_string_lossy();
         assert_eq!(part.parent().unwrap(), target.parent().unwrap());
