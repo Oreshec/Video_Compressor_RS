@@ -360,6 +360,8 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
     std::thread::spawn(move || {
         let mut ok = 0usize;
         let mut cancelled = false;
+        // Хотя бы одна из ошибок похожа на отказ записи (маркеры deny_like).
+        let mut deny_seen = false;
 
         for (pos, (idx, path, info)) in jobs.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
@@ -432,6 +434,12 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
                 Err(CoreError::Cancelled) => (5, "Отменено".to_string(), None),
                 Err(e) => (4, e.short_message(), Some(e.message())),
             };
+            // При запуске из OneDrive-зоны отказ записи — главная догадка:
+            // дополняем текст ошибки объяснением сразу, а не только в логе.
+            let err_full = err_full.map(|m| {
+                deny_seen |= deny_like(&m);
+                with_onedrive_hint(&m)
+            });
             match &result {
                 Ok(res) => logging::log(&format!(
                     "job: готово {} → {} · {:.1} МБ · попыток {} · кодер {}",
@@ -479,7 +487,14 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
             } else if ok == total {
                 "Готово: все файлы сжаты".into()
             } else {
-                format!("Готово: {ok}/{total}, с ошибками").into()
+                // Финальный статус затирает текст ошибки — повторяем хинт здесь,
+                // иначе причина с OneDrive-запуском останется невидимой.
+                let tail = if deny_seen && ONEDRIVE_EXE_WARN.load(Ordering::Relaxed) {
+                    ONEDRIVE_HINT
+                } else {
+                    ""
+                };
+                format!("Готово: {ok}/{total}, с ошибками{tail}").into()
             };
             ui.set_status_text(final_status);
         });
@@ -503,6 +518,36 @@ fn path_under_onedrive(path: &std::path::Path) -> bool {
         .any(|component| component.eq_ignore_ascii_case("OneDrive"))
 }
 
+/// Флаг старта: exe находится в OneDrive-зоне (см. path_under_onedrive).
+/// Читается на потоке заданий при формировании сообщений об ошибках.
+static ONEDRIVE_EXE_WARN: AtomicBool = AtomicBool::new(false);
+
+/// Маркеры отказа записи в тексте ошибки (ffmpeg stderr, диагностика, I/O).
+const ONEDRIVE_DENY_MARKERS: [&str; 3] = [
+    "Permission denied",
+    "Отказано в доступе",
+    "os error 5",
+];
+
+/// Постфикс с объяснением для отказа записи при OneDrive-запуске.
+const ONEDRIVE_HINT: &str =
+    "\n\nпричина: программа запущена из папки синхронизации OneDrive — Windows (Smart App Control) блокирует запись вне этой папки. Запустите копию из %LOCALAPPDATA%\\Programs\\vc-ui";
+
+/// Похоже ли сообщение на отказ записи (основа для OneDrive-хинта).
+fn deny_like(err: &str) -> bool {
+    ONEDRIVE_DENY_MARKERS.iter().any(|marker| err.contains(marker))
+}
+
+/// Дополняет текст ошибки объяснением OneDrive-блокировки, когда
+/// приложение запущено из OneDrive-зоны и ошибка похожа на отказ записи.
+fn with_onedrive_hint(err: &str) -> String {
+    if ONEDRIVE_EXE_WARN.load(Ordering::Relaxed) && deny_like(err) {
+        format!("{err}{ONEDRIVE_HINT}")
+    } else {
+        err.to_owned()
+    }
+}
+
 fn main() {
     install_panic_log();
     force_software_renderer();
@@ -519,6 +564,7 @@ fn main() {
     let onedrive_warn = std::env::current_exe()
         .map(|exe| path_under_onedrive(&exe))
         .unwrap_or(false);
+    ONEDRIVE_EXE_WARN.store(onedrive_warn, Ordering::Relaxed);
     if onedrive_warn {
         logging::log(
             "предупреждение: exe в папке синхронизации OneDrive — запись результатов в другие папки (Рабочий стол и т.п.) может быть заблокирована Smart App Control (os error 5). Скопируйте программу в обычную папку (например, %LOCALAPPDATA%\\Programs) и запускайте оттуда",
@@ -689,8 +735,9 @@ fn main() {
 
 #[cfg(test)]
 mod onedrive_tests {
-    use super::path_under_onedrive;
+    use super::{deny_like, path_under_onedrive, with_onedrive_hint, ONEDRIVE_EXE_WARN};
     use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn detects_onedrive_components() {
@@ -729,5 +776,37 @@ mod onedrive_tests {
         assert!(!path_under_onedrive(Path::new(
             r"C:\Users\user\OneDrive.exe\vc-ui.exe"
         )));
+    }
+
+    #[test]
+    fn deny_markers_recognize_write_denial() {
+        // ffmpeg-текст об ошибке открытия выходного файла.
+        assert!(deny_like(
+            "Error opening output C:\\x\\out.part-1.mp4: Permission denied"
+        ));
+        // Наша диагностика probes / CoreError::OutputReplace.
+        assert!(deny_like("Отказано в доступе. (os error 5)"));
+        assert!(!deny_like("интерфейс не найден (os error 2)"));
+        assert!(!deny_like(""));
+    }
+
+    #[test]
+    fn onedrive_hint_appended_only_when_flag_and_denial() {
+        // Восстанавливаем флаг, чтобы не влиять на другие тесты.
+        let was = ONEDRIVE_EXE_WARN.load(Ordering::Relaxed);
+        ONEDRIVE_EXE_WARN.store(false, Ordering::Relaxed);
+        // Флаг сброшен: хинт не добавляется даже при отказе записи.
+        assert_eq!(
+            with_onedrive_hint(" Permission denied"),
+            " Permission denied"
+        );
+        // Флаг установлен + отказ записи → добавляется объяснение.
+        ONEDRIVE_EXE_WARN.store(true, Ordering::Relaxed);
+        let hinted = with_onedrive_hint("ошибка: Permission denied");
+        assert!(hinted.contains("Smart App Control"));
+        assert!(hinted.ends_with("%LOCALAPPDATA%\\Programs\\vc-ui"));
+        // Флаг установлен, но ошибка не про запись → без хинта.
+        assert_eq!(with_onedrive_hint("файл не найден"), "файл не найден");
+        ONEDRIVE_EXE_WARN.store(was, Ordering::Relaxed);
     }
 }
