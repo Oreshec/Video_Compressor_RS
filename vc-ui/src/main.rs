@@ -548,6 +548,60 @@ fn with_onedrive_hint(err: &str) -> String {
     }
 }
 
+/// Каталог автономной установки: exe с правом записи вне OneDrive-зон.
+fn relocate_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|local| PathBuf::from(local).join("Programs").join("vc-ui"))
+}
+
+/// Целевой путь exe в каталоге автономной установки.
+fn relocate_dest(dir: &Path) -> PathBuf {
+    dir.join("vc-ui.exe")
+}
+
+/// Exe уже лежит в каталоге автономной установки (копировать не нужно).
+/// Строго: родитель exe == каталог, подпапки каталога не считаются.
+fn already_relocated(exe: &Path, dir: &Path) -> bool {
+    exe.parent() == Some(dir)
+}
+
+/// Автопереезд из OneDrive-зоны: копирует текущий exe в обычную папку
+/// (%LOCALAPPDATA%\Programs\vc-ui) и запускает его оттуда с теми же
+/// аргументами. Взаимный выход из спора «пользователь запускает из repo»:
+/// запуск из repo остаётся, а само приложение переезжает.
+///
+/// Возвращает true, если новый процесс запущен — текущий следует завершить.
+fn try_self_relocate(exe: &Path) -> bool {
+    let Some(dir) = relocate_dir() else {
+        logging::log("relocate: LOCALAPPDATA недоступен — автопереезд невозможен");
+        return false;
+    };
+    if already_relocated(exe, &dir) {
+        return false;
+    }
+    let dest = relocate_dest(&dir);
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(exe, &dest)) {
+        logging::log(&format!(
+            "relocate: не удалось скопировать {} → {}: {e} (вероятно, копия ещё запущена)",
+            exe.display(),
+            dest.display()
+        ));
+        return false;
+    }
+    let mut command = std::process::Command::new(&dest);
+    command.args(std::env::args().skip(1));
+    match command.spawn() {
+        Ok(_) => {
+            logging::log(&format!("relocate: перезапуск из {}", dest.display()));
+            true
+        }
+        Err(e) => {
+            logging::log(&format!("relocate: не удалось запустить {}: {e}", dest.display()));
+            false
+        }
+    }
+}
+
 fn main() {
     install_panic_log();
     force_software_renderer();
@@ -557,23 +611,32 @@ fn main() {
         std::env::var("VC_UI_ADVANCED").ok(),
         std::env::var("VC_UI_BASIC_OPEN").ok(),
     ));
-    // Диагностика запуска из OneDrive-зоны: на таких машинах запись
-    // результатов в другие папки может блокироваться политикой Windows
-    // (см. path_under_onedrive) — предупреждаем заранее, не дожидаясь
-    // непонятного «Permission denied» в середине сжатия.
-    let onedrive_warn = std::env::current_exe()
-        .map(|exe| path_under_onedrive(&exe))
+    // Диагностика и обход запуска из OneDrive-зоны: на таких машинах
+    // запись результатов в другие папки блокируется политикой Windows
+    // (см. path_under_onedrive). Пользователь запускает из repo как
+    // обычно — приложение само копирует свежий exe в автономную папку
+    // и перезапускается оттуда, минуя блокировку.
+    let exe_path = std::env::current_exe().ok();
+    let onedrive_warn = exe_path
+        .as_deref()
+        .map(path_under_onedrive)
         .unwrap_or(false);
     ONEDRIVE_EXE_WARN.store(onedrive_warn, Ordering::Relaxed);
     if onedrive_warn {
         logging::log(
-            "предупреждение: exe в папке синхронизации OneDrive — запись результатов в другие папки (Рабочий стол и т.п.) может быть заблокирована Smart App Control (os error 5). Скопируйте программу в обычную папку (например, %LOCALAPPDATA%\\Programs) и запускайте оттуда",
+            "предупреждение: exe в папке синхронизации OneDrive — запись результатов в другие папки (Рабочий стол и т.п.) заблокирована Smart App Control (os error 5)",
         );
+        let relocated = exe_path.as_deref().is_some_and(try_self_relocate);
+        if relocated {
+            logging::log("relocate: текущий процесс завершается, продолжает обычная копия");
+            std::process::exit(0);
+        }
+        logging::log("relocate: автопереезд не удался — продолжаем из OneDrive-зоны; при отказе записи в статусе появится объяснение");
     }
     let app = MainWindow::new().expect("Не удалось создать окно");
     if onedrive_warn {
         app.set_status_text(
-            "Внимание: программа в папке OneDrive — запись результатов вне неё может блокироваться (Smart App Control). Подробности в логе"
+            "Внимание: программа в папке OneDrive — переезжаем в обычную папку (см. лог)"
                 .into(),
         );
     }
@@ -735,8 +798,11 @@ fn main() {
 
 #[cfg(test)]
 mod onedrive_tests {
-    use super::{deny_like, path_under_onedrive, with_onedrive_hint, ONEDRIVE_EXE_WARN};
-    use std::path::Path;
+    use super::{
+        already_relocated, deny_like, path_under_onedrive, relocate_dest, with_onedrive_hint,
+        ONEDRIVE_EXE_WARN,
+    };
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -808,5 +874,32 @@ mod onedrive_tests {
         // Флаг установлен, но ошибка не про запись → без хинта.
         assert_eq!(with_onedrive_hint("файл не найден"), "файл не найден");
         ONEDRIVE_EXE_WARN.store(was, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn relocate_dest_joins_exe_name() {
+        assert_eq!(
+            relocate_dest(Path::new(r"C:\apps\vc-ui")),
+            PathBuf::from(r"C:\apps\vc-ui\vc-ui.exe")
+        );
+    }
+
+    #[test]
+    fn already_relocated_checks_destination_tree() {
+        let dir = Path::new(r"C:\apps\vc-ui");
+        assert!(already_relocated(Path::new(r"C:\apps\vc-ui\vc-ui.exe"), dir));
+        assert!(!already_relocated(
+            Path::new(r"C:\apps\vc-ui\old\vc-ui.exe"),
+            dir
+        ));
+        assert!(!already_relocated(
+            Path::new(r"C:\Users\user\repo\vc-ui\vc-ui.exe"),
+            dir
+        ));
+        // Имя похоже, но другой компонент каталога — не считаем «уже там».
+        assert!(!already_relocated(
+            Path::new(r"C:\apps\vc-ui-extra\vc-ui.exe"),
+            dir
+        ));
     }
 }
