@@ -486,6 +486,24 @@ fn start_job(ui: &MainWindow, _model: &Rc<VecModel<FileInfo>>, hub: &Arc<Hub>) {
     });
 }
 
+/// Проверяет, находится ли путь внутри зоны синхронизации OneDrive
+/// (любой компонент пути равен «OneDrive», регистр не важен).
+///
+/// Зачем: на машинах со Smart App Control исполняемый файл, запущенный
+/// из OneDrive-синхронизируемой папки, теряет право записи вне неё
+/// (os error 5 «Permission denied» даже для новых файлов) — см. лог
+/// `vc-ui.log`, метки «job: диагностика». Сам exe внутри зоны OneDrive
+/// при этом пишет нормально, поэтому запрет маскируется под
+/// «прав на папку нет», хотя права всех процессов идентичны.
+fn path_under_onedrive(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("OneDrive")
+    })
+}
+
 fn main() {
     install_panic_log();
     force_software_renderer();
@@ -495,7 +513,25 @@ fn main() {
         std::env::var("VC_UI_ADVANCED").ok(),
         std::env::var("VC_UI_BASIC_OPEN").ok(),
     ));
+    // Диагностика запуска из OneDrive-зоны: на таких машинах запись
+    // результатов в другие папки может блокироваться политикой Windows
+    // (см. path_under_onedrive) — предупреждаем заранее, не дожидаясь
+    // непонятного «Permission denied» в середине сжатия.
+    let onedrive_warn = std::env::current_exe()
+        .map(|exe| path_under_onedrive(&exe))
+        .unwrap_or(false);
+    if onedrive_warn {
+        logging::log(
+            "предупреждение: exe в папке синхронизации OneDrive — запись результатов в другие папки (Рабочий стол и т.п.) может быть заблокирована Smart App Control (os error 5). Скопируйте программу в обычную папку (например, %LOCALAPPDATA%\\Programs) и запускайте оттуда",
+        );
+    }
     let app = MainWindow::new().expect("Не удалось создать окно");
+    if onedrive_warn {
+        app.set_status_text(
+            "Внимание: программа в папке OneDrive — запись результатов вне неё может блокироваться (Smart App Control). Подробности в логе"
+                .into(),
+        );
+    }
 
     // Версия + авто-обновление.
     app.set_version_label(format!("Версия {CURRENT_VERSION}").into());
@@ -650,4 +686,45 @@ fn main() {
 
     app.run().unwrap();
     logging::log("=== приложение закрыто ===");
+}
+
+#[cfg(test)]
+mod onedrive_tests {
+    use super::path_under_onedrive;
+    use std::path::Path;
+
+    #[test]
+    fn detects_onedrive_components() {
+        assert!(path_under_onedrive(Path::new(
+            r"C:\Users\user\OneDrive\Desktop\vc-ui.exe"
+        )));
+        assert!(path_under_onedrive(Path::new(
+            r"C:\Users\user\onedrive\Documents\repo\Video_Compressor_RS\vc-ui.exe"
+        )));
+        // Проверка нечувствительна к регистру компонента.
+        assert!(path_under_onedrive(Path::new(
+            r"C:\Users\user\ONEDRIVE\x\vc-ui.exe"
+        )));
+        // UNC-префикс пути не должен ломать проверку остальных компонентов.
+        assert!(path_under_onedrive(Path::new(
+            r"\\?\C:\Users\user\OneDrive\vc-ui.exe"
+        )));
+    }
+
+    #[test]
+    fn passes_normal_locations() {
+        assert!(!path_under_onedrive(Path::new(
+            r"C:\Users\user\AppData\Local\Programs\vc-ui\vc-ui.exe"
+        )));
+        assert!(!path_under_onedrive(Path::new(r"D:\tools\vc-ui.exe")));
+        assert!(!path_under_onedrive(Path::new("vc-ui.exe")));
+        assert!(!path_under_onedrive(Path::new("")));
+        // Похожие, но иные имена папок не считаются OneDrive-зоной.
+        assert!(!path_under_onedrive(Path::new(
+            r"C:\Users\user\OneDriveOld\apps\vc-ui.exe"
+        )));
+        assert!(!path_under_onedrive(Path::new(
+            r"C:\Users\user\OneDrive.exe\vc-ui.exe"
+        )));
+    }
 }
