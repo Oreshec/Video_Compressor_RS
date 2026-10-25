@@ -167,9 +167,18 @@ component VcPrimaryButton inherits Rectangle {
 // Зона добавления файлов. Клик = диалог; приём из ОС — задел под API Slint.
 component DropZone inherits Rectangle {
     in property <bool> compact: false;
+    // В расширенном режиме контента больше — разрешаем зоне сжиматься.
+    in property <bool> shrinkable: false;
     callback open-files();
 
-    height: compact ? 64px : 180px;
+    // Высота — через min/max, а не фиксированный height: фиксированное
+    // значение делало max-высоту жёсткой, панель файлов не могла расти,
+    // и лишнее место уходило панели настроек.
+    min-height: compact ? 64px : (shrinkable ? 120px : 180px);
+    max-height: compact ? 64px : 2000px;
+    // Нефиксированный размер (условное выражение) позволяет раскладке
+    // растягивать зону — тогда она забирает свободное место панели файлов.
+    vertical-stretch: compact ? 0 : 1;
     property <bool> hover: ta.has-hover;
     background: hover ? Palette.surface2 : Palette.bg;
     border-width: 2px;
@@ -279,7 +288,7 @@ export component MainWindow inherits Window {
     // Настройки.
     in-out property <int> size-mb: 10;
     in-out property <bool> advanced: false;
-    in-out property <bool> basic-open: true;
+    in-out property <bool> basic-open: false;
     in-out property <int> profile-index: 0;
     in-out property <int> preset-index: 1;
     in-out property <int> resolution-index: 0;
@@ -340,7 +349,6 @@ export component MainWindow inherits Window {
                 advanced: root.advanced;
                 changed(adv) => {
                     root.advanced = adv;
-                    root.basic-open = true;
                     root.mode-changed(adv);
                 }
             }
@@ -373,7 +381,7 @@ export component MainWindow inherits Window {
                     VcToolButton { caption: "Папка"; enabled: !root.busy; clicked => { root.pick-folder(); } }
                     VcToolButton { caption: "Очистить"; enabled: root.file-count > 0 && !root.busy; clicked => { root.clear-files(); } }
                 }
-                if root.file-count == 0: DropZone { open-files => { root.pick-files(); } }
+                if root.file-count == 0: DropZone { shrinkable: root.advanced; open-files => { root.pick-files(); } }
                 if root.file-count > 0: DropZone { compact: true; open-files => { root.pick-files(); } }
                 if root.file-count > 0: Rectangle {
                     vertical-stretch: 1;
@@ -401,13 +409,14 @@ export component MainWindow inherits Window {
         //  Настройки: целевой размер, режимы, панель параметров      //
         // ---------------------------------------------------------- //
         Rectangle {
+            vertical-stretch: 0;
             border-radius: 10px;
             background: Palette.panel;
             border-width: 1px;
             border-color: Palette.border;
             VerticalBox {
                 padding: 14px;
-                spacing: 10px;
+                spacing: 8px;
 
                 HorizontalBox {
                     padding: 0;
@@ -473,26 +482,15 @@ export component MainWindow inherits Window {
                     Rectangle { horizontal-stretch: 1; }
                 }
 
-                // Профиль скорости — расширенный режим (§5.3).
-                if root.advanced: HorizontalBox {
-                    padding: 0;
-                    spacing: 12px;
-                    Text {
-                        text: "Профиль скорости:";
-                        color: Palette.text-muted;
-                        width: 150px;
-                        vertical-alignment: center;
-                    }
-                    ComboBox {
-                        width: 240px;
-                        model: root.preset-models;
-                        current-index <=> root.preset-index;
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-
                 // Сворачиваемая панель основных параметров: в простом
-                // режиме скрывается, в расширенном видна всегда.
+                // режиме скрыта по умолчанию (§4.2 п.7), в расширенном
+                // развёрнута всегда (§5.3).
+                if root.advanced: Text {
+                    text: "Видео";
+                    color: Palette.text-muted;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
                 if root.advanced || root.basic-open: VerticalBox {
                     padding: 2px;
                     spacing: 10px;
@@ -534,27 +532,61 @@ export component MainWindow inherits Window {
                         }
                         Rectangle { horizontal-stretch: 1; }
                     }
-                    CheckBox {
-                        text: "Двухпроходное кодирование (точнее размер, дольше)";
-                        checked <=> root.two-pass;
-                    }
-                    HorizontalBox {
-                        padding: 0;
-                        spacing: 12px;
-                        Text {
-                            text: "Папка результата:";
-                            color: Palette.text-muted;
-                            width: 150px;
-                            vertical-alignment: center;
-                        }
-                        LineEdit {
-                            horizontal-stretch: 1;
-                            placeholder-text: "Рядом с исходными файлами";
-                            text <=> root.output-dir;
-                        }
-                        VcToolButton { caption: "Обзор…"; clicked => { root.pick-output-folder(); } }
-                    }
                 }
+                if root.advanced: Text {
+                    text: "Кодирование";
+                    color: Palette.text-muted;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                if root.advanced: HorizontalBox {
+                    padding: 0;
+                    spacing: 12px;
+                    Text {
+                        text: "Профиль скорости:";
+                        color: Palette.text-muted;
+                        width: 150px;
+                        vertical-alignment: center;
+                    }
+                    ComboBox {
+                        width: 240px;
+                        model: root.preset-models;
+                        current-index <=> root.preset-index;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                if root.advanced: CheckBox {
+                    text: "Двухпроходное кодирование (точнее размер, дольше)";
+                    checked <=> root.two-pass;
+                }
+                if root.advanced: Text {
+                    text: "Вывод";
+                    color: Palette.text-muted;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                if root.advanced: HorizontalBox {
+                    padding: 0;
+                    spacing: 12px;
+                    Text {
+                        text: "Папка результата:";
+                        color: Palette.text-muted;
+                        width: 150px;
+                        vertical-alignment: center;
+                    }
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        placeholder-text: "Рядом с исходными файлами";
+                        text <=> root.output-dir;
+                    }
+                    VcToolButton { caption: "Обзор…"; clicked => { root.pick-output-folder(); } }
+                }
+
+                // Распорка: всё лишнее место забирает она, а не строки
+                // с виджетами (иначе SpinBox/ComboBox разбухают по высоте).
+                // preferred-height нужен нулевой: голый Rectangle иначе
+                // считается «заполнить родителя» и раздувает панель.
+                Rectangle { vertical-stretch: 1; preferred-height: 0px; }
             }
         }
 

@@ -487,6 +487,14 @@ fn main() {
     app.set_version_label(format!("Версия {CURRENT_VERSION}").into());
     spawn_update_check(app.as_weak(), true);
 
+    // Отладка вёрстки: VC_UI_BASIC_OPEN=1 / VC_UI_ADVANCED=1 → старт в другом состоянии.
+    if std::env::var("VC_UI_BASIC_OPEN").as_deref() == Ok("1") {
+        app.set_basic_open(true);
+    }
+    if std::env::var("VC_UI_ADVANCED").as_deref() == Ok("1") {
+        app.set_advanced(true);
+    }
+
     // FFmpeg: найден в системе / рядом с программой.
     let ffmpeg = find_ffmpeg();
     let encoders = ffmpeg
